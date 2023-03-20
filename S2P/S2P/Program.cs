@@ -95,7 +95,7 @@ namespace S2P
             s2plog.AddComments(new Dictionary<string, string> { { "Interpolation Time Stamp", $"{timestamp:MM/dd/yyyy hh/mm/ss tt}" } });
             s2plog.AddComments(new Dictionary<string, string> { {"Custom Data Interpolation Factor", $"{interpolFactor}"} });
 
-            string fileName = $"INTERPOLATED_{path[(path.LastIndexOf('\\') + 1)..]}";
+            string fileName = $"INTERPOLATED{interpolFactor}X_{path[(path.LastIndexOf('\\') + 1)..]}";
             string s2pFilePath = $"{path[..(path.LastIndexOf('\\') + 1)]}{fileName}";
             s2plog.Save(s2pFilePath);
         }
