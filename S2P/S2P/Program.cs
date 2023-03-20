@@ -20,7 +20,7 @@ namespace S2P
                 TextFieldType = FieldType.Delimited
             };
             parser.SetDelimiters(" ");
-            string?[] header = new string[11];
+            string?[] header = new string[50];
             List<double> magS11 = new();
             List<double> magS21 = new();
             List<double> magS12 = new();
@@ -32,10 +32,16 @@ namespace S2P
             List<double> freqs = new();
             List<double> SparamValues = new();
 
-            for (int i = 0; i < 11; i++)
+            for (int i = 0; i < 50; i++)
             {
-                //Processing row
                 header[i] = parser.ReadLine();
+                
+                if (header[i]?[0] == '#')
+                {
+                    header[i + 1] = parser.ReadLine();
+                    break;
+                }
+                if (i == 49) throw new Exception($"Didnt find '#' in header after {i} lines");
             }
             while (!parser.EndOfData)
             {
@@ -95,8 +101,8 @@ namespace S2P
             s2plog.AddComments(new Dictionary<string, string> { { "Interpolation Time Stamp", $"{timestamp:MM/dd/yyyy hh/mm/ss tt}" } });
             s2plog.AddComments(new Dictionary<string, string> { {"Custom Data Interpolation Factor", $"{interpolFactor}"} });
 
-            string fileName = $"INTERPOLATED{interpolFactor}X_{path[(path.LastIndexOf('\\') + 1)..]}";
-            string s2pFilePath = $"{path[..(path.LastIndexOf('\\') + 1)]}{fileName}";
+            string fileName = $"INTERPOLATED{interpolFactor}X_{path.Substring(path.LastIndexOf('\\') + 1)}";
+            string s2pFilePath = $"{path.Remove(path.LastIndexOf('\\') + 1)}{fileName}";
             s2plog.Save(s2pFilePath);
         }
         public static List<double> InterpolateData(List<double> inputData, int interpolationFactor)
@@ -118,7 +124,7 @@ namespace S2P
                 }
             }
 
-            outputData.Add(inputData[^1]);
+            outputData.Add(inputData[inputData.Count - 1]);
 
             return outputData;
         }
