@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Temporary files
+*.txt
+!requirements.txt
+
+# Output files (keep examples, ignore user-generated)
+iq_separated.*
+*_eAxC*.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
