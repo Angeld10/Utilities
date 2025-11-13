@@ -6,6 +6,8 @@ import sys
 import os
 import struct
 import math
+import re
+import json
 import numpy as np
 from collections import defaultdict
 from scapy.all import rdpcap  # type: ignore
@@ -145,14 +147,16 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
         bfp_bitwidth: Unused
     
     Returns:
-        tuple: (samples_list, compression_type, num_samples)
+        tuple: (samples_list, compression_type, num_samples, exponents_list)
+        where exponents_list is a list of exponents (one per RB) or None if uncompressed
     """
     iq_data_bytes = ecpri_data[iq_offset:]
     samples = []
     compression_type = "uncompressed"
+    exponents_list = None
     
     if len(iq_data_bytes) == 0:
-        return samples, compression_type, 0
+        return samples, compression_type, 0, exponents_list
     
     if FORCE_COMPRESSION_TYPE is None:
         raise ValueError("FORCE_COMPRESSION_TYPE must be set")
@@ -171,16 +175,91 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
             raise ValueError(f"Invalid FORCE_BFP_BITWIDTH: {FORCE_BFP_BITWIDTH}")
         
         bfp_bits = FORCE_BFP_BITWIDTH
-        exponent = iq_data_bytes[0]
-        if exponent < 0 or exponent > 15:
-            raise ValueError(f"Invalid BFP exponent: {exponent}")
+        samples_per_rb = 12
+        max_rbs = 106  # Maximum RBs in 5G NR
         
-        compressed_data = iq_data_bytes[1:]
+        # In BFP, there's typically one exponent per Resource Block (RB)
+        # Each RB has 12 subcarriers (samples)
+        # Calculate bytes per sample for compressed data
+        if bfp_bits == 8:
+            bytes_per_sample = 2  # 1 byte I + 1 byte Q
+        else:
+            # For N-bit compression: (2*N) bits per sample
+            bytes_per_sample = (2 * bfp_bits) / 8
+        
+        # Strategy: Try to determine number of RBs by working backwards from data size
+        # Total size = num_rbs (exponent bytes) + (num_rbs * 12 * bytes_per_sample) (compressed data)
+        # So: total_size = num_rbs * (1 + 12 * bytes_per_sample)
+        # Therefore: num_rbs = total_size / (1 + 12 * bytes_per_sample)
+        
+        total_bytes = len(iq_data_bytes)
+        estimated_rbs = int(total_bytes / (1 + 12 * bytes_per_sample))
+        
+        # Clamp to reasonable range (1 to max_rbs)
+        estimated_rbs = max(1, min(estimated_rbs, max_rbs))
+        
+        # Try reading that many exponents, but also try reading more if the pattern suggests it
+        # Read exponents: try estimated_rbs first, but also check if we can read more
+        exponents_list = []
+        exponent_offset = 0
+        
+        # Read up to max_rbs exponent bytes, but stop if we encounter values > 15
+        # (which are unlikely to be exponents)
+        for i in range(min(estimated_rbs, max_rbs, len(iq_data_bytes))):
+            exp_byte = iq_data_bytes[i]
+            if exp_byte > 15:
+                # This might be compressed data, stop here
+                break
+            exponents_list.append(int(exp_byte))
+            exponent_offset = i + 1
+        
+        # If we read fewer exponents than estimated, try reading a few more
+        # (in case some exponents are > 15, which is valid but less common)
+        if len(exponents_list) < estimated_rbs and exponent_offset < len(iq_data_bytes):
+            # Try reading a few more bytes as exponents
+            for i in range(exponent_offset, min(exponent_offset + 10, len(iq_data_bytes))):
+                exp_byte = iq_data_bytes[i]
+                if exp_byte > 15:
+                    break
+                exponents_list.append(int(exp_byte))
+                exponent_offset = i + 1
+        
+        # If we still don't have exponents, fall back to single exponent
+        if len(exponents_list) == 0:
+            # Fallback: use single exponent
+            exponent = iq_data_bytes[0]
+            if exponent < 0 or exponent > 15:
+                raise ValueError(f"Invalid BFP exponent: {exponent}")
+            exponents_list = [int(exponent)]
+            compressed_data = iq_data_bytes[1:]
+            exponent = exponents_list[0]
+        else:
+            # Use the exponents we found
+            compressed_data = iq_data_bytes[exponent_offset:]
+            # Use the first exponent for decompression (decompress function only supports one)
+            exponent = exponents_list[0]
         
         try:
+            # Decompress using the first exponent
             samples = decompress_bfp(compressed_data, exponent, bits_per_sample=bfp_bits)
             compression_type = f"BFP_{bfp_bits}bit"
-            return samples, compression_type, len(samples)
+            
+            # Calculate actual number of RBs from decompressed samples
+            actual_num_rbs = int(np.ceil(len(samples) / samples_per_rb))
+            
+            # Adjust exponents list to match actual number of RBs
+            if len(exponents_list) == 1:
+                # Single exponent case - replicate for all RBs
+                exponents_list = exponents_list * actual_num_rbs
+            elif len(exponents_list) > actual_num_rbs:
+                # Truncate if we read too many
+                exponents_list = exponents_list[:actual_num_rbs]
+            elif len(exponents_list) < actual_num_rbs:
+                # Extend with last exponent if we didn't read enough
+                last_exp = exponents_list[-1] if exponents_list else 0
+                exponents_list.extend([last_exp] * (actual_num_rbs - len(exponents_list)))
+            
+            return samples, compression_type, len(samples), exponents_list
         except Exception as e:
             raise ValueError(f"BFP decompression failed: {e}")
     
@@ -195,7 +274,7 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
         # Create complex array
         samples = (iq_reshaped[:, 0] + 1j * iq_reshaped[:, 1]).tolist()
     
-    return samples, compression_type, num_samples
+    return samples, compression_type, num_samples, exponents_list
 
 def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
     """Analyze PCAP file and display summary information without extracting full data"""
@@ -266,7 +345,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
                 # Skip headers to get IQ data
                 iq_offset = 16
                 # Parse IQ samples (handles both uncompressed and BFP compressed)
-                samples, compression_type, num_samples = parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index,
+                samples, compression_type, num_samples, exponents_list = parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, 
                                                                      force_bfp=force_bfp, bfp_exponent=bfp_exponent)
                 
                 # Track compression type
@@ -419,7 +498,11 @@ def plot_resource_allocation(analysis_data, pcap_file):
     max_rbs_limit = 106
     
     # Get base name and directory for output files
-    pcap_dir = os.path.dirname(pcap_file) if os.path.dirname(pcap_file) else '.'
+    # Create Plots directory in the workspace root (IQAnalysis folder)
+    workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
+    plots_dir = os.path.join(workspace_root, 'Plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    
     base_name = os.path.basename(pcap_file)
     base_name = base_name.replace('.pcap', '')
     
@@ -587,8 +670,8 @@ def plot_resource_allocation(analysis_data, pcap_file):
         
         plt.tight_layout(pad=3.0)
         
-        # Save plot with higher DPI in the same directory as input file
-        output_file = os.path.join(pcap_dir, f'{base_name}_eAxC{eaxc_id}_resource_allocation.png')
+        # Save plot with higher DPI in Plots directory
+        output_file = os.path.join(plots_dir, f'{base_name}_eAxC{eaxc_id}_resource_allocation.png')
         plt.savefig(output_file, dpi=200, bbox_inches='tight')
         print(f"Saved resource allocation plot for eAxC {eaxc_id}: {output_file}")
         plt.close()
@@ -647,7 +730,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                 # Skip eCPRI header (4) + PC_ID/SeqID (4) + radio header (8) = 16 bytes total
                 iq_offset = 16
                 # Parse IQ samples (handles both uncompressed and BFP compressed)
-                samples, compression_type, num_samples = parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, 
+                samples, compression_type, num_samples, exponents_list = parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, 
                                                                           force_bfp=force_bfp, bfp_exponent=bfp_exponent)
                 
                 # Store samples by eAxC ID and direction
@@ -663,8 +746,14 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                         max_iq_values[eaxc_id]['max_q'] = max_q
                         max_iq_values[eaxc_id]['max_abs'] = max_abs
                 
+                # Use the exponents list directly if BFP (already one per RB)
+                rb_exponents = None
+                if compression_type.startswith('BFP') and exponents_list is not None:
+                    # exponents_list already contains one exponent per RB
+                    rb_exponents = [int(exp) for exp in exponents_list]
+                
                 # Store metadata for this packet
-                iq_data[eaxc_id]['metadata'].append({
+                metadata_entry = {
                     'direction': direction,
                     'seq_id': seq_id,
                     'frame_id': frame_id,
@@ -675,7 +764,13 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                     'filter_index': filter_index,
                     'compression_type': compression_type,
                     'payload_version': payload_version
-                })
+                }
+                
+                # Add RB exponents array if BFP compression is used
+                if rb_exponents is not None:
+                    metadata_entry['rb_exponents'] = rb_exponents
+                
+                iq_data[eaxc_id]['metadata'].append(metadata_entry)
     
     print(f"Processed {packet_count} IQ data packets\n")
     
@@ -762,8 +857,28 @@ def save_separated_data(iq_data, output_base):
         
         # Save metadata
         metadata_file = f"{output_base}_eAxC{eaxc_id}_metadata.json"
+        # Write JSON to string first
+        json_str = json.dumps(iq_data[eaxc_id]['metadata'], indent=2)
+        
+        # Compress rb_exponents arrays to single line using regex
+        # Pattern matches: "rb_exponents": [\n        <numbers>,\n        ...\n      ]
+        def compress_rb_exponents(match):
+            indent = match.group(1)  # Capture the indentation before "rb_exponents"
+            array_content = match.group(2)  # Capture all the array content (numbers, commas, newlines)
+            # Extract all numbers from the array content
+            numbers = re.findall(r'\d+', array_content)
+            # Join them with comma and space
+            compressed = ', '.join(numbers)
+            return f'{indent}"rb_exponents": [{compressed}]'
+        
+        # Pattern to match rb_exponents arrays with multiline formatting
+        # Uses a more general approach: match everything between [ and ] for rb_exponents
+        # This handles any formatting within the array
+        pattern = r'(\s+)"rb_exponents": \[([^\]]+)\]'
+        json_str = re.sub(pattern, compress_rb_exponents, json_str, flags=re.DOTALL)
+        
         with open(metadata_file, 'w') as f:
-            json.dump(iq_data[eaxc_id]['metadata'], f, indent=2)
+            f.write(json_str)
         print(f"Saved: {metadata_file}")
     
     print()
@@ -892,9 +1007,16 @@ def get_sample_range_for_symbols(iq_data, eaxc_id, direction, start_symbol=None,
     
     return (first_index, last_index)
 
-def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, end_symbol=None):
+def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None):
     """Create comparison plots for UL vs DL"""
     import matplotlib.pyplot as plt
+    import os
+    
+    # If plots_dir is provided, update output_file to be in that directory
+    if plots_dir is not None:
+        os.makedirs(plots_dir, exist_ok=True)
+        output_filename = os.path.basename(output_file)
+        output_file = os.path.join(plots_dir, output_filename)
     
     # Find an eAxC ID that has both UL and DL data
     eaxc_with_both = None
@@ -970,9 +1092,16 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     print(f"Saved comparison plot: {output_file}\n")
     plt.close()
 
-def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, end_symbol=None):
+def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None):
     """Create individual plots for each eAxC ID"""
     import matplotlib.pyplot as plt
+    import os
+    
+    # Use provided plots_dir or create Plots directory in workspace root
+    if plots_dir is None:
+        workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
+        plots_dir = os.path.join(workspace_root, 'Plots')
+    os.makedirs(plots_dir, exist_ok=True)
     
     for eaxc_id in sorted(iq_data.keys()):
         for direction in ['UL', 'DL']:
@@ -1033,7 +1162,7 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
             axes[1, 1].axis('equal')
             
             plt.tight_layout()
-            plot_file = f"{output_base}_eAxC{eaxc_id}_{direction}.png"
+            plot_file = os.path.join(plots_dir, f"{output_base}_eAxC{eaxc_id}_{direction}.png")
             plt.savefig(plot_file, dpi=150, bbox_inches='tight')
             print(f"Saved plot: {plot_file}")
             plt.close()
@@ -1077,6 +1206,11 @@ if __name__ == "__main__":
     if len(iq_data) == 0:
         print("No IQ data found!")
         sys.exit(1)
+    
+    # Create Plots directory in workspace root
+    workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
+    plots_dir = os.path.join(workspace_root, 'Plots')
+    os.makedirs(plots_dir, exist_ok=True)
     
     # Save separated data
     print("Saving data files...")
@@ -1144,12 +1278,12 @@ if __name__ == "__main__":
     # Create comparison plot
     print("Creating comparison plot...")
     plot_comparison(iq_data, f"{args.output_base}_UL_vs_DL.png", max_samples=max_samples, 
-                    start_symbol=start_symbol, end_symbol=end_symbol)
+                    start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir)
     
     # Create individual plots for each eAxC/direction
     print("Creating individual plots...")
     plot_all_eaxc(iq_data, args.output_base, max_samples=max_samples, 
-                  start_symbol=start_symbol, end_symbol=end_symbol)
+                  start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir)
     
     print("Done!")
 
