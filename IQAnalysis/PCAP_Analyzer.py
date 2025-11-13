@@ -11,8 +11,8 @@ from collections import defaultdict
 from scapy.all import rdpcap  # type: ignore
 from scapy.layers.l2 import Dot1Q  # type: ignore
 
-FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed'
-FORCE_BFP_BITWIDTH = 16                  # 8-14 for BFP compression
+FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
+FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 
 def calculate_max_iq(samples):
@@ -527,24 +527,42 @@ def plot_resource_allocation(analysis_data, pcap_file):
         
         # Create figure - adjust height based on number of RBs, make it bigger
         fig_height = max(10, min(24, max_rbs * 0.4))
-        fig_width = max(18, num_columns * 0.8)  # Adjust width based on number of columns
+        # Cap width to prevent excessive stretching of last symbol
+        # Use a reasonable maximum width and scale columns more conservatively
+        fig_width = min(30, max(12, num_columns * 0.6))  # Capped at 30, reduced multiplier
         fig, ax = plt.subplots(figsize=(fig_width, fig_height))
         
-        # Create the heatmap
+        # Create the heatmap with better aspect control
+        # Use a calculated aspect ratio to keep columns consistent width
         im = ax.imshow(grid, aspect='auto', cmap=cmap, interpolation='nearest', 
                        vmin=0, vmax=max_rbs)
         
-        # Set ticks and labels with larger fonts
+        # Adjust x-axis limits to prevent stretching of last column
+        ax.set_xlim(-0.5, num_columns - 0.5)
+        
+        # Set ticks and labels - only show labels for first symbol of each slot
         ax.set_xticks(range(num_columns))
-        # Create labels showing frame/subframe/slot/symbol for each column
+        # Create labels showing frame/subframe/slot for first symbol of each slot only
         column_labels = []
+        seen_slots = set()  # Track (frame, subframe, slot) combinations we've labeled
         for combo in unique_combinations:
             if len(combo) == 4:  # (frame_id, subframe_id, slot_id, symbol_id)
                 frame_id, subframe_id, slot_id, symbol_id = combo
-                column_labels.append(f'F{frame_id}SF{subframe_id}S{slot_id}Sy{symbol_id}')
+                slot_key = (frame_id, subframe_id, slot_id)
+                # Only label the first symbol of each slot
+                if slot_key not in seen_slots:
+                    column_labels.append(f'F{frame_id}SF{subframe_id}S{slot_id}')
+                    seen_slots.add(slot_key)
+                else:
+                    column_labels.append('')  # Empty label for other symbols in the slot
             else:  # Backward compatibility
                 frame_id, slot_id, symbol_id = combo
-                column_labels.append(f'F{frame_id}S{slot_id}Sy{symbol_id}')
+                slot_key = (frame_id, slot_id)
+                if slot_key not in seen_slots:
+                    column_labels.append(f'F{frame_id}S{slot_id}')
+                    seen_slots.add(slot_key)
+                else:
+                    column_labels.append('')
         ax.set_xticklabels(column_labels, fontsize=11, rotation=45, ha='right')
         
         # Set Y-axis labels for RBs - show every 10th RB only, ensure max is shown
@@ -562,23 +580,10 @@ def plot_resource_allocation(analysis_data, pcap_file):
         ax.grid(which='minor', color='black', linestyle='-', linewidth=0.8, alpha=0.6)
         
         # Labels with larger fonts
-        ax.set_xlabel('Frame/Subframe/Slot/Symbol Combination', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Frame/Subframe/Slot (labeled at first symbol of each slot)', fontsize=14, fontweight='bold')
         ax.set_ylabel('Resource Block (RB) Index', fontsize=14, fontweight='bold')
         ax.set_title(f'Resource Allocation: eAxC ID {eaxc_id}\n(Each column = unique Frame/Subframe/Slot/Symbol, Each cell = 1 RB = 12 subcarriers)', 
                      fontsize=16, fontweight='bold', pad=20)
-        
-        # Add text annotations showing sample counts (only for first RB of each combination to avoid clutter)
-        for col_idx, combo in enumerate(unique_combinations):
-            combo_info = combination_data[combo]
-            if combo_info['rbs'] > 0:
-                # Show sample count on the first RB of this combination
-                first_rb = 0
-                samples = combo_info['samples']
-                if samples > 0:
-                    ax.text(col_idx, first_rb, f'{int(samples):,}', 
-                           ha='center', va='center', color='white', 
-                           fontsize=10, fontweight='bold', 
-                           bbox=dict(boxstyle='round,pad=0.5', facecolor='black', alpha=0.7))
         
         plt.tight_layout(pad=3.0)
         
@@ -723,6 +728,9 @@ def save_separated_data(iq_data, output_base):
             print(f"Saved: {filename}.npy ({len(ul_array):,} samples)")
             
             # Save UL statistics
+            avg_power = np.mean(np.abs(ul_array)**2)
+            full_scale_power = 32767.0 ** 2  # Full scale power for 16-bit signed integers
+            avg_power_dbfs = 10 * math.log10(avg_power / full_scale_power) if avg_power > 0 else float('-inf')
             with open(f"{filename}_stats.txt", 'w') as f:
                 f.write(f"eAxC ID: {eaxc_id}\n")
                 f.write(f"Direction: Uplink (UL)\n")
@@ -730,7 +738,7 @@ def save_separated_data(iq_data, output_base):
                 f.write(f"I - Mean: {np.mean(ul_array.real):.2f}, Std: {np.std(ul_array.real):.2f}\n")
                 f.write(f"Q - Mean: {np.mean(ul_array.imag):.2f}, Std: {np.std(ul_array.imag):.2f}\n")
                 f.write(f"Magnitude - Mean: {np.mean(np.abs(ul_array)):.2f}, Max: {np.max(np.abs(ul_array)):.2f}\n")
-                f.write(f"Average Power: {np.mean(np.abs(ul_array)**2):.2f}\n")
+                f.write(f"Average Power: {avg_power_dbfs:.2f} dBFS\n")
         
         # Save DL data
         if len(iq_data[eaxc_id]['DL']) > 0:
@@ -740,6 +748,9 @@ def save_separated_data(iq_data, output_base):
             print(f"Saved: {filename}.npy ({len(dl_array):,} samples)")
             
             # Save DL statistics
+            avg_power = np.mean(np.abs(dl_array)**2)
+            full_scale_power = 32767.0 ** 2  # Full scale power for 16-bit signed integers
+            avg_power_dbfs = 10 * math.log10(avg_power / full_scale_power) if avg_power > 0 else float('-inf')
             with open(f"{filename}_stats.txt", 'w') as f:
                 f.write(f"eAxC ID: {eaxc_id}\n")
                 f.write(f"Direction: Downlink (DL)\n")
@@ -747,7 +758,7 @@ def save_separated_data(iq_data, output_base):
                 f.write(f"I - Mean: {np.mean(dl_array.real):.2f}, Std: {np.std(dl_array.real):.2f}\n")
                 f.write(f"Q - Mean: {np.mean(dl_array.imag):.2f}, Std: {np.std(dl_array.imag):.2f}\n")
                 f.write(f"Magnitude - Mean: {np.mean(np.abs(dl_array)):.2f}, Max: {np.max(np.abs(dl_array)):.2f}\n")
-                f.write(f"Average Power: {np.mean(np.abs(dl_array)**2):.2f}\n")
+                f.write(f"Average Power: {avg_power_dbfs:.2f} dBFS\n")
         
         # Save metadata
         metadata_file = f"{output_base}_eAxC{eaxc_id}_metadata.json"
