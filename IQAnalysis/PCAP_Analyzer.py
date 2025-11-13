@@ -11,28 +11,9 @@ from collections import defaultdict
 from scapy.all import rdpcap  # type: ignore
 from scapy.layers.l2 import Dot1Q  # type: ignore
 
-# ============================================================================
-# COMPRESSION CONFIGURATION
-# ============================================================================
-# Override auto-detection by setting these variables:
-# - Set FORCE_COMPRESSION_TYPE to 'BFP' or 'uncompressed'
-# - Set FORCE_BFP_BITWIDTH to 8-14 for BFP compression
-# - Set FORCE_BFP_EXPONENT to 0-15 for BFP exponent (None = auto-detect from packet)
-# Leave as None to use auto-detection
-#
-# Examples:
-#   FORCE_COMPRESSION_TYPE = 'BFP'
-#   FORCE_BFP_BITWIDTH = 10
-#   FORCE_BFP_EXPONENT = 5
-#
-#   FORCE_COMPRESSION_TYPE = 'uncompressed'  # Force 16-bit uncompressed
-#
-#   FORCE_COMPRESSION_TYPE = None  # Use auto-detection (default)
-# ============================================================================
-FORCE_COMPRESSION_TYPE = None  # Options: None, 'BFP', 'uncompressed'
-FORCE_BFP_BITWIDTH = None      # Options: None, 8, 9, 10, 11, 12, 13, 14
-FORCE_BFP_EXPONENT = None      # Options: None, 0-15
-# ============================================================================
+FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed'
+FORCE_BFP_BITWIDTH = 16                  # 8-14 for BFP compression
+NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 
 def calculate_max_iq(samples):
     """
@@ -152,16 +133,16 @@ def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
 
 def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force_bfp=False, bfp_exponent=None, bfp_bitwidth=None):
     """
-    Parse IQ samples from eCPRI packet, handling both uncompressed and BFP compressed formats
+    Parse IQ samples from eCPRI packet.
     
     Args:
         ecpri_data: eCPRI packet data
         iq_offset: Offset to start of IQ data
-        payload_version: Payload version from radio header (bits 4-6 of byte 8)
-        filter_index: Filter index from radio header (bits 0-3 of byte 8)
-        force_bfp: If True, force BFP decompression (overridden by FORCE_COMPRESSION_TYPE)
-        bfp_exponent: Explicit exponent value (overridden by FORCE_BFP_EXPONENT)
-        bfp_bitwidth: Explicit bitwidth (overridden by FORCE_BFP_BITWIDTH)
+        payload_version: Payload version from radio header
+        filter_index: Filter index from radio header
+        force_bfp: Force BFP decompression
+        bfp_exponent: Unused
+        bfp_bitwidth: Unused
     
     Returns:
         tuple: (samples_list, compression_type, num_samples)
@@ -173,118 +154,35 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
     if len(iq_data_bytes) == 0:
         return samples, compression_type, 0
     
-    # Check configuration variables first (highest priority)
-    use_config_override = False
-    config_compression_type = None
-    config_bfp_bitwidth = None
-    config_bfp_exponent = None
+    if FORCE_COMPRESSION_TYPE is None:
+        raise ValueError("FORCE_COMPRESSION_TYPE must be set")
     
-    if FORCE_COMPRESSION_TYPE is not None:
-        use_config_override = True
-        config_compression_type = FORCE_COMPRESSION_TYPE.lower()
-        if config_compression_type == 'bfp':
-            config_bfp_bitwidth = FORCE_BFP_BITWIDTH if FORCE_BFP_BITWIDTH is not None else (bfp_bitwidth if bfp_bitwidth is not None else 8)
-            config_bfp_exponent = FORCE_BFP_EXPONENT if FORCE_BFP_EXPONENT is not None else bfp_exponent
-        elif config_compression_type == 'uncompressed':
-            # Force uncompressed
-            pass
-        else:
-            raise ValueError(f"Invalid FORCE_COMPRESSION_TYPE: {FORCE_COMPRESSION_TYPE}. Must be 'BFP' or 'uncompressed'")
+    config_compression_type = FORCE_COMPRESSION_TYPE.lower()
+    if config_compression_type not in ['bfp', 'uncompressed']:
+        raise ValueError(f"Invalid FORCE_COMPRESSION_TYPE: {FORCE_COMPRESSION_TYPE}")
     
-    # Determine compression type and parameters
-    use_bfp = force_bfp or (use_config_override and config_compression_type == 'bfp')
-    use_uncompressed = (use_config_override and config_compression_type == 'uncompressed')
-    bfp_bits = config_bfp_bitwidth if use_config_override else (bfp_bitwidth if bfp_bitwidth is not None else 8)
-    detected_exponent = None
+    use_bfp = (config_compression_type == 'bfp') or force_bfp
+    use_uncompressed = (config_compression_type == 'uncompressed')
     
-    # If forcing uncompressed, skip all BFP detection
-    if use_uncompressed:
-        use_bfp = False
-    elif not use_bfp:
-        # Auto-detection logic for BFP compression
-        # Check if first byte could be exponent (0-15 is typical range for BFP)
-        if len(iq_data_bytes) > 1:
-            potential_exponent = iq_data_bytes[0]
-            compressed_data = iq_data_bytes[1:]
-            
-            # Calculate expected sample counts for different formats
-            uncompressed_samples = len(iq_data_bytes) // 4  # 16-bit: 4 bytes per sample
-            
-            # Try to detect BFP compression for bitwidths 8-14
-            best_match = None
-            best_score = 0
-            
-            for test_bits in range(8, 15):  # Test 8-14 bits
-                if test_bits == 8:
-                    # 8-bit: 2 bytes per sample (1 I + 1 Q)
-                    test_samples = len(compressed_data) // 2
-                    expected_size = (test_samples * 2) + 1  # +1 for exponent
-                    size_ratio = len(compressed_data) / len(iq_data_bytes) if len(iq_data_bytes) > 0 else 0
-                else:
-                    # 9-14 bit: bit-packed
-                    bits_per_sample_pair = 2 * test_bits
-                    test_samples = (len(compressed_data) * 8) // bits_per_sample_pair
-                    expected_size = ((test_samples * bits_per_sample_pair + 7) // 8) + 1  # +1 for exponent, round up bytes
-                    size_ratio = len(compressed_data) / len(iq_data_bytes) if len(iq_data_bytes) > 0 else 0
-                
-                # Score based on:
-                # 1. Exponent in valid range
-                # 2. Size ratio matches expected (8-bit ~50%, 9-bit ~56%, 10-bit ~62%, etc.)
-                # 3. Sample count consistency
-                score = 0
-                if 0 <= potential_exponent <= 15:
-                    score += 1
-                
-                # Expected size ratio for N-bit BFP: (2*N/32) = N/16
-                expected_ratio = test_bits / 16.0
-                ratio_diff = abs(size_ratio - expected_ratio)
-                if ratio_diff < 0.1:  # Within 10% of expected
-                    score += 2
-                
-                # Check if sample count makes sense
-                if test_samples > 0 and test_samples == uncompressed_samples:
-                    score += 1
-                elif test_samples > 0 and abs(test_samples - uncompressed_samples) <= 2:
-                    score += 0.5
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = (test_bits, potential_exponent, test_samples)
-            
-            # If we found a good match (score >= 2), use it
-            if best_match and best_score >= 2:
-                use_bfp = True
-                bfp_bits = best_match[0]
-                detected_exponent = best_match[1]
-    
-    # Apply compression based on determined type
     if use_bfp:
-        # Use configured or detected values
-        exponent = config_bfp_exponent if use_config_override and config_bfp_exponent is not None else (
-                   bfp_exponent if bfp_exponent is not None else detected_exponent)
+        if FORCE_BFP_BITWIDTH is None:
+            raise ValueError("FORCE_BFP_BITWIDTH must be set")
+        if FORCE_BFP_BITWIDTH < 8 or FORCE_BFP_BITWIDTH > 14:
+            raise ValueError(f"Invalid FORCE_BFP_BITWIDTH: {FORCE_BFP_BITWIDTH}")
         
-        if exponent is None:
-            # Try to extract from first byte
-            if len(iq_data_bytes) > 0:
-                exponent = iq_data_bytes[0]
-                compressed_data = iq_data_bytes[1:]
-            else:
-                exponent = 0
-                compressed_data = iq_data_bytes
-        else:
-            # Exponent provided or detected, skip first byte
-            compressed_data = iq_data_bytes[1:] if len(iq_data_bytes) > 1 else iq_data_bytes
+        bfp_bits = FORCE_BFP_BITWIDTH
+        exponent = iq_data_bytes[0]
+        if exponent < 0 or exponent > 15:
+            raise ValueError(f"Invalid BFP exponent: {exponent}")
         
-        if 0 <= exponent <= 15 and 8 <= bfp_bits <= 14:
-            try:
-                samples = decompress_bfp(compressed_data, exponent, bits_per_sample=bfp_bits)
-                compression_type = f"BFP_{bfp_bits}bit"
-                return samples, compression_type, len(samples)
-            except Exception as e:
-                # If forced BFP fails, raise error; otherwise fall back
-                if use_config_override or force_bfp:
-                    raise ValueError(f"BFP decompression failed: {e}")
-                # Fall through to uncompressed
+        compressed_data = iq_data_bytes[1:]
+        
+        try:
+            samples = decompress_bfp(compressed_data, exponent, bits_per_sample=bfp_bits)
+            compression_type = f"BFP_{bfp_bits}bit"
+            return samples, compression_type, len(samples)
+        except Exception as e:
+            raise ValueError(f"BFP decompression failed: {e}")
     
     # Default: Uncompressed 16-bit IQ samples (big-endian signed integers)
     # Use numpy for efficient parsing
@@ -322,7 +220,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
         'symbol_counts': defaultdict(int),
         'symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0})),  # symbol_id -> eaxc_id -> stats
         'slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(int))),  # slot_id -> symbol_id -> eaxc_id -> count
-        'frame_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0})))),  # frame_id -> slot_id -> symbol_id -> eaxc_id -> stats
+        'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0}))))),  # frame_id -> subframe_id -> slot_id -> symbol_id -> eaxc_id -> stats
         'compression_types': set(),  # Track compression types found
         'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0})  # Track max uncompressed I/Q values per eAxC ID
     }
@@ -398,8 +296,8 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
                 analysis_data['symbol_eaxc_data'][symbol_id][eaxc_id]['packets'] += 1
                 analysis_data['symbol_eaxc_data'][symbol_id][eaxc_id]['samples'] += num_samples
                 analysis_data['slot_symbol_eaxc_data'][slot_id][symbol_id][eaxc_id] += 1
-                analysis_data['frame_slot_symbol_eaxc_data'][frame_id][slot_id][symbol_id][eaxc_id]['packets'] += 1
-                analysis_data['frame_slot_symbol_eaxc_data'][frame_id][slot_id][symbol_id][eaxc_id]['samples'] += num_samples
+                analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id][eaxc_id]['packets'] += 1
+                analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id][eaxc_id]['samples'] += num_samples
     
     # Calculate duration
     duration_sec = 0
@@ -509,13 +407,16 @@ def plot_resource_allocation(analysis_data, pcap_file):
         print("Insufficient data for resource allocation plot")
         return
     
+    if NUMEROLOGY is None:
+        raise ValueError("NUMEROLOGY must be set")
+    if NUMEROLOGY not in [0, 1]:
+        raise ValueError(f"Invalid NUMEROLOGY: {NUMEROLOGY}")
+    
     symbol_list = sorted(analysis_data['symbols'])
     eaxc_list = sorted(analysis_data['eaxc_ids'])
     
-    # Calculate RBs per symbol per eAxC ID
-    # In 5G NR: 1 RB = 12 subcarriers, typically 1 sample per subcarrier per symbol
-    # So: samples / 12 ≈ number of RBs
-    samples_per_rb = 12  # Standard: 12 subcarriers per RB
+    samples_per_rb = 12
+    max_rbs_limit = 106
     
     # Get base name and directory for output files
     pcap_dir = os.path.dirname(pcap_file) if os.path.dirname(pcap_file) else '.'
@@ -524,30 +425,50 @@ def plot_resource_allocation(analysis_data, pcap_file):
     
     # Create a separate plot for each eAxC ID
     for eaxc_id in eaxc_list:
-        # Collect all unique (frame, slot, symbol) combinations for this eAxC ID
+        # Collect all unique (frame, subframe, slot, symbol) combinations for this eAxC ID
         unique_combinations = []
-        combination_data = {}  # (frame, slot, symbol) -> {'samples': X, 'rbs': Y}
+        combination_data = {}  # (frame, subframe, slot, symbol) -> {'samples': X, 'rbs': Y}
         
         for frame_id in sorted(analysis_data['frames']):
-            for slot_id in sorted(analysis_data['slots']):
-                for symbol_id in sorted(analysis_data['symbols']):
-                    if (frame_id in analysis_data['frame_slot_symbol_eaxc_data'] and
-                        slot_id in analysis_data['frame_slot_symbol_eaxc_data'][frame_id] and
-                        symbol_id in analysis_data['frame_slot_symbol_eaxc_data'][frame_id][slot_id] and
-                        eaxc_id in analysis_data['frame_slot_symbol_eaxc_data'][frame_id][slot_id][symbol_id]):
-                        
-                        samples = analysis_data['frame_slot_symbol_eaxc_data'][frame_id][slot_id][symbol_id][eaxc_id]['samples']
-                        if samples > 0:
-                            combo = (frame_id, slot_id, symbol_id)
-                            unique_combinations.append(combo)
-                            num_rbs = int(np.ceil(samples / samples_per_rb))
-                            combination_data[combo] = {'samples': samples, 'rbs': num_rbs}
+            for subframe_id in sorted(analysis_data['subframes']):
+                for slot_id in sorted(analysis_data['slots']):
+                    for symbol_id in sorted(analysis_data['symbols']):
+                        if (frame_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'] and
+                            subframe_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id] and
+                            slot_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id] and
+                            symbol_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id] and
+                            eaxc_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id]):
+                            
+                            symbol_data = analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id][eaxc_id]
+                            total_samples = symbol_data['samples']
+                            packet_count = symbol_data['packets']
+                            
+                            if total_samples > 0:
+                                combo = (frame_id, subframe_id, slot_id, symbol_id)
+                                unique_combinations.append(combo)
+                                
+                                expected_samples_for_106_rbs = 106 * 12
+                                
+                                if total_samples > expected_samples_for_106_rbs * 1.5:
+                                    ratio = expected_samples_for_106_rbs / total_samples
+                                    estimated_active_subcarriers = total_samples * ratio
+                                    num_rbs = int(np.ceil(estimated_active_subcarriers / samples_per_rb))
+                                else:
+                                    num_rbs = int(np.ceil(total_samples / samples_per_rb))
+                                
+                                if num_rbs > max_rbs_limit:
+                                    num_rbs = max_rbs_limit
+                                combination_data[combo] = {'samples': total_samples, 'rbs': num_rbs, 'packets': packet_count}
         
         if len(unique_combinations) == 0:
             continue  # Skip this eAxC ID if no data
         
         # Find maximum number of RBs across all combinations
         max_rbs = max(combo_data['rbs'] for combo_data in combination_data.values())
+        
+        # Cap at maximum RBs (106 for 5G NR)
+        if max_rbs > max_rbs_limit:
+            max_rbs = max_rbs_limit
         
         if max_rbs == 0:
             continue
@@ -560,7 +481,10 @@ def plot_resource_allocation(analysis_data, pcap_file):
         
         # Fill grid - mark allocated RBs with their RB index + 1
         for col_idx, combo in enumerate(unique_combinations):
-            frame_id, slot_id, symbol_id = combo
+            if len(combo) == 4:  # (frame_id, subframe_id, slot_id, symbol_id)
+                frame_id, subframe_id, slot_id, symbol_id = combo
+            else:  # Backward compatibility
+                frame_id, slot_id, symbol_id = combo
             combo_info = combination_data[combo]
             num_rbs_for_combo = combo_info['rbs']
             
@@ -612,16 +536,25 @@ def plot_resource_allocation(analysis_data, pcap_file):
         
         # Set ticks and labels with larger fonts
         ax.set_xticks(range(num_columns))
-        # Create labels showing frame/slot/symbol for each column
+        # Create labels showing frame/subframe/slot/symbol for each column
         column_labels = []
-        for frame_id, slot_id, symbol_id in unique_combinations:
-            column_labels.append(f'F{frame_id}S{slot_id}Sy{symbol_id}')
+        for combo in unique_combinations:
+            if len(combo) == 4:  # (frame_id, subframe_id, slot_id, symbol_id)
+                frame_id, subframe_id, slot_id, symbol_id = combo
+                column_labels.append(f'F{frame_id}SF{subframe_id}S{slot_id}Sy{symbol_id}')
+            else:  # Backward compatibility
+                frame_id, slot_id, symbol_id = combo
+                column_labels.append(f'F{frame_id}S{slot_id}Sy{symbol_id}')
         ax.set_xticklabels(column_labels, fontsize=11, rotation=45, ha='right')
         
-        # Set Y-axis labels for RBs - show every 10th RB only
+        # Set Y-axis labels for RBs - show every 10th RB only, ensure max is shown
         y_ticks = list(range(0, max_rbs, 10))
+        if max_rbs not in y_ticks:
+            y_ticks.append(max_rbs)
         ax.set_yticks(y_ticks)
         ax.set_yticklabels([f'RB {i}' for i in y_ticks], fontsize=11)
+        # Set y-axis limit to max_rbs (capped at 106) to ensure it doesn't go beyond 106
+        ax.set_ylim(-0.5, max_rbs - 0.5)
         
         # Add grid lines
         ax.set_xticks(np.arange(num_columns) - 0.5, minor=True)
@@ -629,9 +562,9 @@ def plot_resource_allocation(analysis_data, pcap_file):
         ax.grid(which='minor', color='black', linestyle='-', linewidth=0.8, alpha=0.6)
         
         # Labels with larger fonts
-        ax.set_xlabel('Frame/Slot/Symbol Combination', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Frame/Subframe/Slot/Symbol Combination', fontsize=14, fontweight='bold')
         ax.set_ylabel('Resource Block (RB) Index', fontsize=14, fontweight='bold')
-        ax.set_title(f'Resource Allocation: eAxC ID {eaxc_id}\n(Each column = unique Frame/Slot/Symbol, Each cell = 1 RB = 12 subcarriers)', 
+        ax.set_title(f'Resource Allocation: eAxC ID {eaxc_id}\n(Each column = unique Frame/Subframe/Slot/Symbol, Each cell = 1 RB = 12 subcarriers)', 
                      fontsize=16, fontweight='bold', pad=20)
         
         # Add text annotations showing sample counts (only for first RB of each combination to avoid clutter)
@@ -1100,36 +1033,25 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Extract IQ samples from 5G NR Fronthaul PCAP files',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  python PCAP_Analyzer.py capture.pcap --analyze
-  python PCAP_Analyzer.py capture.pcap
-  python PCAP_Analyzer.py capture.pcap iq_data
-  python PCAP_Analyzer.py capture.pcap iq_data --symbols 10
-  python PCAP_Analyzer.py capture.pcap iq_data --samples 5000
-  python PCAP_Analyzer.py capture.pcap iq_data --start-symbol 5 --end-symbol 10
-  python PCAP_Analyzer.py capture.pcap iq_data --start-symbol 0 --end-symbol 13
-        '''
+        description='Extract IQ samples from 5G NR Fronthaul PCAP files'
     )
     parser.add_argument('pcap_file', help='Path to PCAP file')
     parser.add_argument('output_base', nargs='?', default='iq_separated',
                        help='Base name for output files (default: iq_separated)')
     parser.add_argument('--symbols', type=int, metavar='N',
-                       help='Number of symbols to plot from the start (overrides --samples if specified, ignored if --start-symbol/--end-symbol specified)')
+                       help='Number of symbols to plot')
     parser.add_argument('--samples', type=int, default=10000, metavar='N',
-                       help='Number of samples to plot (default: 10000, ignored if --symbols or symbol range is specified)')
+                       help='Number of samples to plot (default: 10000)')
     parser.add_argument('--start-symbol', type=int, metavar='N',
-                       help='Start symbol ID for analysis (inclusive, 0-63)')
+                       help='Start symbol ID (0-63)')
     parser.add_argument('--end-symbol', type=int, metavar='N',
-                       help='End symbol ID for analysis (inclusive, 0-63)')
+                       help='End symbol ID (0-63)')
     parser.add_argument('--analyze', action='store_true',
-                       help='Analyze PCAP file and display summary information (no extraction/plotting)')
+                       help='Analyze PCAP file only')
     parser.add_argument('--force-bfp', action='store_true',
-                       help='Force BFP (Block Floating Point) decompression for all packets')
+                       help='Force BFP decompression')
     parser.add_argument('--bfp-exponent', type=int, metavar='N',
-                       help='Explicit BFP exponent value (0-15). If not specified, will auto-detect from packet')
+                       help='BFP exponent value (0-15)')
     
     args = parser.parse_args()
     
