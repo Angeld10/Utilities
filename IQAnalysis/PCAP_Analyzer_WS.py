@@ -1318,7 +1318,7 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
     
     print()
 
-def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None):
+def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False):
     """Analyze PCAP file and display summary information without extracting full data (using pyshark)
     
     Args:
@@ -1342,9 +1342,16 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     # 5G NR typically has 14 symbols per slot (for normal cyclic prefix)
     # This can be adjusted if needed, but 14 is standard
     SYMBOLS_PER_SLOT = 14
+    # 5G NR has 10 subframes per frame
+    SUBFRAMES_PER_FRAME = 10
+    # Slots per subframe depends on numerology (0 = 1 slot, 1 = 2 slots)
+    # Default to 1 slot per subframe if NUMEROLOGY is not set
+    SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
     
     # Track the first (frame, subframe, slot) combination for filtering
-    # When filtering by overall symbols, we want only symbols from the first frame/subframe/slot
+    # Only restrict to first frame/subframe/slot when restrict_to_first_combo is True (i.e., when using --symbols)
+    # When using --symbols N, we want the first N overall symbols from the first frame/subframe/slot
+    # When using --start-symbol/--end-symbol, we want symbols from ANY frame/subframe/slot in that range
     first_frame_subframe_slot = None
     
     try:
@@ -1460,29 +1467,37 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
             # This ensures we capture all slots even if they're filtered out later
             analysis_data['slots_seen_in_fields'].add(slot_id)
             
-            # When filtering by overall symbol, identify the first (frame, subframe, slot) combination
-            # We want only symbols from the very first frame/subframe/slot, not from all combinations
-            if (start_symbol is not None or end_symbol is not None) and first_frame_subframe_slot is None:
-                first_frame_subframe_slot = (frame_id, subframe_id, slot_id)
-            
-            # Calculate overall symbol number: overall_symbol = slot_id * SYMBOLS_PER_SLOT + symbol_id
-            # This represents the absolute symbol number across all slots
-            overall_symbol = slot_id * SYMBOLS_PER_SLOT + start_symbol_id
+            # Calculate overall symbol number: count continuously across frames, subframes, slots, and symbols
+            # Formula: (frame * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) +
+            #          (subframe * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) +
+            #          (slot * SYMBOLS_PER_SLOT) +
+            #          symbol_id
+            # This represents the absolute symbol number across all frames/subframes/slots
+            overall_symbol = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                            (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                            (slot_id * SYMBOLS_PER_SLOT) + \
+                            start_symbol_id
             
             # Filter by overall symbol number if specified (must happen BEFORE incrementing packet_count)
-            # Additionally, when filtering, only include packets from the first frame/subframe/slot combination
             if start_symbol is not None or end_symbol is not None:
-                # First check if this packet is from the first frame/subframe/slot combination
-                if first_frame_subframe_slot is not None:
-                    current_combo = (frame_id, subframe_id, slot_id)
-                    if current_combo != first_frame_subframe_slot:
-                        continue  # Skip packets not from the first frame/subframe/slot
-                
-                # Then check overall symbol range
+                # Check overall symbol range first
                 if start_symbol is not None and overall_symbol < start_symbol:
                     continue
                 if end_symbol is not None and overall_symbol > end_symbol:
                     continue
+                
+                # Only restrict to first frame/subframe/slot when using --symbols (not --start-symbol/--end-symbol)
+                # When --symbols is used, we want the first N overall symbols from the first frame/subframe/slot
+                # When --start-symbol/--end-symbol is used directly, we want symbols from ANY frame/subframe/slot
+                if restrict_to_first_combo:
+                    # Identify the first (frame, subframe, slot) combination that matches the range
+                    if first_frame_subframe_slot is None:
+                        first_frame_subframe_slot = (frame_id, subframe_id, slot_id)
+                    
+                    # Only include packets from the first frame/subframe/slot combination
+                    current_combo = (frame_id, subframe_id, slot_id)
+                    if current_combo != first_frame_subframe_slot:
+                        continue  # Skip packets not from the first frame/subframe/slot
             
             # Increment packet count only after filtering - this should match the sum of overall_symbol_counts
             analysis_data['packet_count'] += 1
@@ -1934,28 +1949,25 @@ def plot_resource_allocation(analysis_data, pcap_file):
         # Adjust x-axis limits to prevent stretching of last column
         ax.set_xlim(-0.5, num_columns - 0.5)
         
-        # Set ticks and labels - only show labels for first symbol of each slot
+        # Set ticks and labels - only show first, last, and symbols with symbol_id = 0
         ax.set_xticks(range(num_columns))
         column_labels = []
-        seen_slots = set()  # Track (frame, subframe, slot) combinations we've labeled
-        for combo in unique_combinations:
+        for col_idx, combo in enumerate(unique_combinations):
+            is_first = (col_idx == 0)
+            is_last = (col_idx == len(unique_combinations) - 1)
+            
             if len(combo) == 4:  # (frame_id, subframe_id, slot_id, symbol_id)
                 frame_id, subframe_id, slot_id, symbol_id = combo
-                slot_key = (frame_id, subframe_id, slot_id)
-                # Only label the first symbol of each slot
-                if slot_key not in seen_slots:
-                    column_labels.append(f'F{frame_id}SF{subframe_id}S{slot_id}')
-                    seen_slots.add(slot_key)
+                if is_first or is_last or symbol_id == 0:
+                    column_labels.append(f'F{frame_id}SF{subframe_id}S{slot_id}Sym{symbol_id}')
                 else:
-                    column_labels.append('')  # Empty label for other symbols in the slot
+                    column_labels.append('')  # Empty label for other symbols
             else:  # Backward compatibility
                 frame_id, slot_id, symbol_id = combo
-                slot_key = (frame_id, slot_id)
-                if slot_key not in seen_slots:
-                    column_labels.append(f'F{frame_id}S{slot_id}')
-                    seen_slots.add(slot_key)
+                if is_first or is_last or symbol_id == 0:
+                    column_labels.append(f'F{frame_id}S{slot_id}Sym{symbol_id}')
                 else:
-                    column_labels.append('')
+                    column_labels.append('')  # Empty label for other symbols
         ax.set_xticklabels(column_labels, fontsize=11, rotation=45, ha='right')
         
         # Set Y-axis labels for RBs - show every 10th RB only, ensure max is shown
@@ -1972,7 +1984,7 @@ def plot_resource_allocation(analysis_data, pcap_file):
         ax.grid(which='minor', color='black', linestyle='-', linewidth=0.8, alpha=0.6)
         
         # Labels with larger fonts
-        ax.set_xlabel('Frame/Subframe/Slot (labeled at first symbol of each slot)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Frame/Subframe/Slot/Symbol', fontsize=14, fontweight='bold')
         ax.set_ylabel('Resource Block (RB) Index', fontsize=14, fontweight='bold')
         ax.set_title(f'Resource Allocation: eAxC ID {eaxc_id}\n(Each column = unique Frame/Subframe/Slot/Symbol, Each cell = 1 RB = 12 subcarriers)', 
                      fontsize=16, fontweight='bold', pad=20)
@@ -2042,8 +2054,11 @@ if __name__ == "__main__":
     
     # If --analyze is specified, just analyze and exit
     if args.analyze:
+        # When --symbols is used, restrict to first frame/subframe/slot
+        # When --start-symbol/--end-symbol is used directly, allow any frame/subframe/slot
+        restrict_to_first = (args.symbols is not None and args.symbols > 0)
         analyze_pcap(args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent, 
-                     start_symbol=start_symbol, end_symbol=end_symbol)
+                     start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first)
         sys.exit(0)
     
     # Extract IQ samples with metadata
