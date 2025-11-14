@@ -23,7 +23,6 @@ except ImportError:
 FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
 FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
-MAX_RBS = 106                            # Maximum Resource Blocks in 5G NR
 ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
 #Debug loop count
@@ -181,7 +180,7 @@ def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
     
     return samples
 
-def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force_bfp=False, bfp_exponent=None, bfp_bitwidth=None):
+def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force_bfp=False, bfp_exponent=None, bfp_bitwidth=None, max_rbs=106):
     """
     Parse IQ samples from eCPRI packet.
     
@@ -225,7 +224,7 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
         
         bfp_bits = FORCE_BFP_BITWIDTH
         samples_per_rb = 12
-        max_rbs = MAX_RBS
+        # max_rbs is now passed as parameter (dynamically determined from ORAN section tree)
         
         # In BFP, there's typically one exponent per Resource Block (RB)
         # Each RB has 12 subcarriers (samples)
@@ -325,7 +324,7 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
     
     return samples, compression_type, num_samples, exponents_list
 
-def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width):
+def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width, max_rbs=106):
     """
     Parse IQ samples from prb_raw list structure.
     
@@ -395,7 +394,7 @@ def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width):
         exponents_list = []
         all_compressed_data = []
         offset = 0
-        max_rbs = MAX_RBS
+        # max_rbs is now passed as parameter (dynamically determined from ORAN section tree)
         
         while offset < len(iq_data_bytes) and len(exponents_list) < max_rbs:
             # Check if we have enough bytes for exponent + RB data
@@ -700,6 +699,18 @@ def get_oran_fh_cus_fields_from_packet(packet):
                         except (ValueError, TypeError, AttributeError):
                             pass
                     
+                    # Number of PRB (numPrbu in section_tree)
+                    if hasattr(section_tree, 'numPrbu'):
+                        try:
+                            val = section_tree.numPrbu
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['num_prbc'] = int(val)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                            
                     # Symbol increment (symInc) - might relate to number of symbols
                     if hasattr(section_tree, 'symInc'):
                         try:
@@ -803,6 +814,8 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
     iq_data = defaultdict(lambda: {'UL': [], 'DL': [], 'metadata': []})
     # Track maximum uncompressed I/Q values per eAxC ID
     max_iq_values = defaultdict(lambda: {'max_i': 0, 'max_q': 0, 'max_abs': 0})
+    # Track maximum num_prbc seen across all packets (dynamically determined)
+    max_num_prbc = 0
     
     print("Processing packets...")
     packet_count = 0
@@ -871,10 +884,26 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             data_direction = fields.get('data_direction', 1)
             direction = 'DL' if data_direction == 1 else 'UL'
             
+            # Get num_prbc from fields (dynamically determined from ORAN section tree)
+            num_prbc = fields.get('num_prbc', None)
+            
+            # Track maximum num_prbc and validate
+            if num_prbc is not None:
+                # Check if this packet exceeds the current maximum before updating
+                if max_num_prbc > 0 and num_prbc > max_num_prbc:
+                    print(f"ERROR: Packet has {num_prbc} PRBs, which exceeds detected maximum of {max_num_prbc} PRBs!")
+                    print(f"  Frame: {frame_id}, Subframe: {subframe_id}, Slot: {slot_id}, Symbol: {start_symbol_id}, eAxC ID: {eaxc_id}")
+                # Update maximum
+                if num_prbc > max_num_prbc:
+                    max_num_prbc = num_prbc
+            
+            # Use max_num_prbc for parsing limits, default to calculated if not available
+            current_max_rbs = max_num_prbc if max_num_prbc > 0 else (num_prbc if num_prbc is not None else 106)
+            
             # Extract IQ samples from prb_raw if available
             if prb_raw is not None:
                 samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw(
-                    prb_raw, compression_method, compression_width)
+                    prb_raw, compression_method, compression_width, max_rbs=current_max_rbs)
             else:
                 # Fallback: try to get raw ORAN FH data
                 oran_data = extract_oran_fh_data_from_packet(packet)
@@ -886,7 +915,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                 # Parse IQ samples (handles both uncompressed and BFP compressed)
                 samples, compression_type, num_samples, exponents_list = parse_iq_samples(
                     oran_data, iq_offset, 0, 0,
-                    force_bfp=force_bfp, bfp_exponent=bfp_exponent)
+                    force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
             
             # Store samples by eAxC ID (RU Port ID) and direction
             iq_data[eaxc_id][direction].extend(samples)
@@ -919,6 +948,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                 'start_symbol_id': start_symbol_id,
                 'num_symbols': num_symbols,
                 'start_prbc': start_prbc,
+                'num_prbc': num_prbc,  # Number of PRBs for this packet
                 'sym_inc': sym_inc,
                 'num_samples': num_samples,
                 'compression_type': compression_type,
@@ -939,6 +969,10 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
     
     cap.close()
     print(f"Processed {packet_count} IQ data packets\n")
+    
+    # Print detected maximum PRBs
+    if max_num_prbc > 0:
+        print(f"Detected maximum PRBs: {max_num_prbc}\n")
     
     # Print summary by eAxC ID
     print("=" * 110)
@@ -1338,7 +1372,8 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
         'slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(int))),
         'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0}))))),
         'compression_types': set(),
-        'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0})
+        'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
+        'max_num_prbc': 0  # Track maximum num_prbc seen across all packets
     }
     
     for packet in cap:
@@ -1403,6 +1438,19 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
             sym_inc = fields.get('sym_inc', 0)
             num_symbols = sym_inc + 1 if sym_inc > 0 else 1
             start_prbc = fields.get('start_prbc', 0)
+            # Get num_prbc from fields (dynamically determined from ORAN section tree)
+            num_prbc = fields.get('num_prbc', None)
+            
+            # Track maximum num_prbc and validate
+            if num_prbc is not None:
+                # Check if this packet exceeds the current maximum before updating
+                if analysis_data.get('max_num_prbc', 0) > 0 and num_prbc > analysis_data['max_num_prbc']:
+                    print(f"ERROR: Packet has {num_prbc} PRBs, which exceeds detected maximum of {analysis_data['max_num_prbc']} PRBs!")
+                    print(f"  Frame: {frame_id}, Subframe: {subframe_id}, Slot: {slot_id}, Symbol: {start_symbol_id}, eAxC ID: {eaxc_id}")
+                # Update maximum
+                if num_prbc > analysis_data.get('max_num_prbc', 0):
+                    analysis_data['max_num_prbc'] = num_prbc
+            
             # Get compression method and width from fields (hardcoded from top variables)
             # Default to BFP if not set
             compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
@@ -1413,10 +1461,13 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
             data_direction = fields.get('data_direction', 1)
             direction = 'DL' if data_direction == 1 else 'UL'
             
+            # Use max_num_prbc for parsing limits, default to calculated if not available
+            current_max_rbs = analysis_data.get('max_num_prbc', 0) if analysis_data.get('max_num_prbc', 0) > 0 else (num_prbc if num_prbc is not None else 106)
+            
             # Extract IQ samples from prb_raw if available
             if prb_raw is not None:
                 samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw(
-                    prb_raw, compression_method, compression_width)
+                    prb_raw, compression_method, compression_width, max_rbs=current_max_rbs)
             else:
                 # Fallback: try to get raw ORAN FH data
                 oran_data = extract_oran_fh_data_from_packet(packet)
@@ -1428,7 +1479,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
                 # Parse IQ samples (handles both uncompressed and BFP compressed)
                 samples, compression_type, num_samples, exponents_list = parse_iq_samples(
                     oran_data, iq_offset, 0, 0,
-                    force_bfp=force_bfp, bfp_exponent=bfp_exponent)
+                    force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
             
             # Track compression type
             analysis_data['compression_types'].add(compression_type)
@@ -1554,6 +1605,10 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
     print("=" * 80)
     print()
     
+    # Print detected maximum PRBs
+    if analysis_data.get('max_num_prbc', 0) > 0:
+        print(f"Detected maximum PRBs: {analysis_data['max_num_prbc']}\n")
+    
     # Create resource allocation plot (reuse function from original)
     if analysis_data['packet_count'] > 0:
         plot_resource_allocation(analysis_data, pcap_file)
@@ -1579,7 +1634,8 @@ def plot_resource_allocation(analysis_data, pcap_file):
     eaxc_list = sorted(analysis_data['eaxc_ids'])
     
     samples_per_rb = 12
-    max_rbs_limit = MAX_RBS
+    # Use dynamically determined max_num_prbc from analysis_data
+    max_rbs_limit = analysis_data.get('max_num_prbc', 106) if analysis_data.get('max_num_prbc', 0) > 0 else 106
     
     # Get base name and directory for output files
     # Create Plots directory in the workspace root (IQAnalysis folder)
@@ -1614,7 +1670,7 @@ def plot_resource_allocation(analysis_data, pcap_file):
                                 combo = (frame_id, subframe_id, slot_id, symbol_id)
                                 unique_combinations.append(combo)
                                 
-                                expected_samples_for_max_rbs = MAX_RBS * 12
+                                expected_samples_for_max_rbs = max_rbs_limit * 12
                                 
                                 if total_samples > expected_samples_for_max_rbs * 1.5:
                                     ratio = expected_samples_for_max_rbs / total_samples
