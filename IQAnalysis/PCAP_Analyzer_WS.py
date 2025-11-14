@@ -26,6 +26,9 @@ NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 MAX_RBS = 106                            # Maximum Resource Blocks in 5G NR
 ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
+#Debug loop count
+debug_count = 0
+
 def calculate_max_iq(samples):
     """
     Calculate maximum uncompressed I/Q values from a list of complex samples.
@@ -74,6 +77,7 @@ def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
     Returns:
         List of complex IQ samples
     """
+    debug_count = 0
     samples = []
     scale_factor = 2.0 ** exponent
     
@@ -118,30 +122,37 @@ def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
         
         def read_n_bits(bit_offset, n_bits):
             """Read n_bits starting at bit_offset"""
+            is_little_endian = (ENDIAN.lower() == 'little')
             value = 0
-            bits_read = 0
             
-            while bits_read < n_bits:
-                byte_idx = bit_offset // 8
-                bit_in_byte = bit_offset % 8
-                
-                if byte_idx >= len(iq_data_bytes):
-                    break
-                
-                # How many bits can we read from this byte?
-                bits_available = 8 - bit_in_byte
-                bits_needed = n_bits - bits_read
-                bits_to_read = min(bits_available, bits_needed)
-                
-                # Extract bits from current byte
-                mask = (1 << bits_to_read) - 1
-                byte_value = (iq_data_bytes[byte_idx] >> bit_in_byte) & mask
-                value |= (byte_value << bits_read)
-                
-                bits_read += bits_to_read
-                bit_offset += bits_to_read
+            if is_little_endian:
+                # Little-endian: bits read LSB-first within bytes
+                for i in range(n_bits):
+                    byte_idx = (bit_offset + i) // 8
+                    bit_in_byte = (bit_offset + i) % 8  # LSB-first: bit 0 is first
+                    
+                    if byte_idx >= len(iq_data_bytes):
+                        break
+                    
+                    # Read the bit from the byte
+                    bit_value = (iq_data_bytes[byte_idx] >> bit_in_byte) & 1
+                    # Assemble in LSB-first order
+                    value = value | (bit_value << i)
+            else:
+                # Big-endian: bits read MSB-first within bytes
+                for i in range(n_bits):
+                    byte_idx = (bit_offset + i) // 8
+                    bit_in_byte = 7 - ((bit_offset + i) % 8)  # MSB-first: bit 7 is first
+                    
+                    if byte_idx >= len(iq_data_bytes):
+                        break
+                    
+                    # Read the bit from the byte
+                    bit_value = (iq_data_bytes[byte_idx] >> bit_in_byte) & 1
+                    # Assemble in MSB-first order
+                    value = (value << 1) | bit_value
             
-            return value, bit_offset
+            return value, bit_offset + n_bits
         
         for i in range(num_samples):
             # Read I component (N bits)
@@ -187,6 +198,7 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
         tuple: (samples_list, compression_type, num_samples, exponents_list)
         where exponents_list is a list of exponents (one per RB) or None if uncompressed
     """
+    global debug_count
     iq_data_bytes = ecpri_data[iq_offset:]
     samples = []
     compression_type = "uncompressed"
@@ -325,6 +337,7 @@ def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width):
     Returns:
         tuple: (samples_list, compression_type, num_samples, exponents_list)
     """
+    global debug_count
     samples = []
     compression_type = "uncompressed"
     exponents_list = None
@@ -344,8 +357,8 @@ def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width):
                     hex_bytes = bytes.fromhex(hex_clean)
                     all_hex_data.append(hex_bytes)
                 except ValueError:
-                    continue
-    
+                    Continue
+
     if not all_hex_data:
         return samples, compression_type, 0, exponents_list
     
@@ -402,7 +415,7 @@ def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width):
             rb_data = iq_data_bytes[offset:offset + bytes_per_rb]
             all_compressed_data.append((exponent, rb_data))
             offset += bytes_per_rb
-        
+
         if len(exponents_list) == 0:
             # No valid RB data found
             return samples, compression_type, 0, None
