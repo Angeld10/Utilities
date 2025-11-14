@@ -435,8 +435,113 @@ def get_oran_fh_cus_fields_from_packet(packet):
                     oran_layer = layer
                     break
         
+        #LOCKED: DO NOT TOUCH THIS CODE UNTIL UNLOCKED
         # If we found the layer, try to extract fields from Wireshark's parsed data
         if oran_layer is not None:
+
+            # print oran_layer attributes
+            printAttrOranLayer = False
+            print_values = False  # Set to False to avoid printing attribute values
+            if printAttrOranLayer:
+                for attr in dir(oran_layer):
+                    if not attr.startswith('_'):
+                        try:
+                            val = getattr(oran_layer, attr)
+                            if print_values:
+                                print(f'oran_layer.{attr} = {val}')
+                            else:
+                                print(f'oran_layer.{attr}')
+                        except Exception as e:
+                            if print_values:
+                                print(f'oran_layer.{attr} = <error: {e}>')
+                            else:
+                                print(f'oran_layer.{attr} = <error>')
+
+            #print timing header
+            print(oran_layer.timingHeader_tree)
+            # Try to get Timing Header Tree
+            timing_header_tree = None
+            for timing_path in ['timingHeader_tree', 'timing_header_tree']:
+                try:
+                    timing_header_tree = getattr(oran_layer, timing_path, None)
+                    if timing_header_tree is not None:
+                        break
+                except (AttributeError, TypeError):
+                    continue
+
+            if timing_header_tree is not None:
+                # Extract fields from timing header tree
+                # Timing Header Tree Contains:
+                # subframe_id
+                # slotId
+                # frameId
+                # symbolId
+                # data_direction
+                try:
+                    # Extract subframe_id
+                    if hasattr(timing_header_tree, 'subframe_id'):
+                        try:
+                            val = timing_header_tree.subframe_id
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['subframe_id'] = int(val)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    
+                    # Extract slotId
+                    if hasattr(timing_header_tree, 'slotId'):
+                        try:
+                            val = timing_header_tree.slotId
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['slot_id'] = int(val)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    
+                    # Extract frameId
+                    if hasattr(timing_header_tree, 'frameId'):
+                        try:
+                            val = timing_header_tree.frameId
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['frame_id'] = int(val)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    
+                    # Extract symbolId
+                    if hasattr(timing_header_tree, 'symbolId'):
+                        try:
+                            val = timing_header_tree.symbolId
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['start_symbol_id'] = int(val)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                    
+                    # Extract data_direction
+                    if hasattr(timing_header_tree, 'data_direction'):
+                        try:
+                            val = timing_header_tree.data_direction
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['data_direction'] = int(val)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                except Exception as e:
+                    print(f"Exception parsing timing_header_tree: {e}")
+                    import traceback
+                    traceback.print_exc()
+
             # Try to get u-plane.section_tree or c-plane.section_tree
             section_tree = None
             for tree_path in ['u-plane.section_tree', 'c-plane.section_tree', 'section_tree']:
@@ -453,7 +558,31 @@ def get_oran_fh_cus_fields_from_packet(packet):
                     # Map section_tree attributes to our field names
                     # Based on the attributes: sectionId, numPrbu, startPrbu, rb, symInc, etc.
                     
-                    # Start PRB (startPrbu in section_tree)
+                    #print section tree attributes
+                    printAttrSectionTree = False
+                    if printAttrSectionTree:
+                        for attr in dir(section_tree):
+                            if not attr.startswith('_'):
+                                try:
+                                    val = getattr(section_tree, attr)
+                                    print(f'section_tree.{attr} = {val}')
+                                except Exception as e:
+                                    print(f'section_tree.{attr} = <error: {e}>')
+
+                    # Section ID (section_id in section_tree)
+                    if hasattr(section_tree, 'sectionId'):
+                        try:
+                            val = section_tree.sectionId
+                            if hasattr(val, 'get_default_value'):
+                                val = val.get_default_value()
+                            elif hasattr(val, 'show'):
+                                val = val.show
+                            fields['sectionId'] = val
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+
+                    # PRB IQ Data (prb_raw in section_tree)
+                    # prb_raw is a list, the first item contains the IQ data, if compression is used, the first byte is the exponent. The rest of the list contains the IQ data.
                     if hasattr(section_tree, 'prb_raw'):
                         try:
                             val = section_tree.prb_raw
@@ -517,70 +646,8 @@ def get_oran_fh_cus_fields_from_packet(packet):
                     print(f"Exception parsing section_tree: {e}")
                     import traceback
                     traceback.print_exc()
-            
-            # Try to get common fields from oran_layer (frame_id, subframe_id, slot_id, etc.)
-            # These might be in a common section or directly on oran_layer
-            common_field_paths = [
-                'common.frameId', 'common.frame_id', 'frameId',
-                'common.subframe_id', 'common.subframeId', 'subframe_id',
-                'common.slotId', 'common.slot_id', 'slotId',
-                'common.startSymbolId', 'common.start_symbol_id', 'startSymbolId',
-                'common.sectionType', 'common.section_type', 'sectionType',
-                'common.data_direction', 'common.dataDirection', 'data_direction',
-                'common.numSymbol', 'common.num_symbols', 'numSymbol', 'num_symbols'
-            ]
-            
-            common_field_mappings = {
-                'frame_id': ['common.frameId', 'common.frame_id', 'frameId'],
-                'subframe_id': ['common.subframe_id', 'common.subframeId', 'subframe_id'],
-                'slot_id': ['common.slotId', 'common.slot_id', 'slotId'],
-                'start_symbol_id': ['common.startSymbolId', 'common.start_symbol_id', 'startSymbolId'],
-                'section_type': ['common.sectionType', 'common.section_type', 'sectionType'],
-                'data_direction': ['common.data_direction', 'common.dataDirection', 'data_direction'],
-                'num_symbols': ['common.numSymbol', 'common.num_symbols', 'numSymbol', 'num_symbols']
-            }
-            
-            for field_key, attr_paths in common_field_mappings.items():
-                if field_key not in fields:
-                    for attr_path in attr_paths:
-                        try:
-                            val = getattr(oran_layer, attr_path, None)
-                            if val is not None:
-                                if hasattr(val, 'get_default_value'):
-                                    val = val.get_default_value()
-                                elif hasattr(val, 'show'):
-                                    val = val.show
-                                try:
-                                    fields[field_key] = int(val)
-                                    break
-                                except (ValueError, TypeError):
-                                    fields[field_key] = str(val)
-                                    break
-                        except (AttributeError, TypeError):
-                            continue
-        
-        # Also get UDP port if available
-        if 'udp' in packet:
-            try:
-                udp = packet.udp
-                src_port = int(udp.srcport) if hasattr(udp, 'srcport') else None
-                dst_port = int(udp.dstport) if hasattr(udp, 'dstport') else None
-                
-                if src_port:
-                    fields['udp_src_port'] = src_port
-                if dst_port:
-                    fields['udp_dst_port'] = dst_port
-                
-                # Determine direction based on port
-                if src_port and 49152 <= src_port <= 65535:
-                    fields['udp_port'] = src_port
-                    fields['direction'] = 'TX'
-                elif dst_port and 49152 <= dst_port <= 65535:
-                    fields['udp_port'] = dst_port
-                    fields['direction'] = 'RX'
-            except Exception as e:
-                print(f"Exception getting UDP port: {e}")
-                pass
+        #UNLOCKED
+
         
         # If we got fields from Wireshark's parsed layer, return them
         if fields:

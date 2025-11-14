@@ -1,7 +1,0 @@
-eAxC ID: 1
-Direction: Downlink (DL)
-Total samples: 529,152
-I - Mean: 17.62, Std: 10607.52
-Q - Mean: -41.40, Std: 10586.02
-Magnitude - Mean: 12033.29, Max: 37676.06
-Average Power: 224585354.50
