@@ -5,6 +5,7 @@ Separates IQ samples by direction (UL/DL) and eAxC ID using pyshark/Wireshark li
 import sys
 import os
 import struct
+import time
 import math
 import re
 import json
@@ -22,6 +23,8 @@ except ImportError:
 FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
 FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
+MAX_RBS = 106                            # Maximum Resource Blocks in 5G NR
+ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
 def calculate_max_iq(samples):
     """
@@ -77,14 +80,31 @@ def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
     if bits_per_sample == 8:
         # 8-bit compression: 1 byte per I, 1 byte per Q
         num_samples = len(iq_data_bytes) // 2
+        is_little_endian = (ENDIAN.lower() == 'little')
+        
         for i in range(num_samples):
-            # Read as unsigned, then convert to signed
-            i_compressed = iq_data_bytes[i * 2]
-            q_compressed = iq_data_bytes[i * 2 + 1]
+            # Read as unsigned, then convert to signed using two's complement
+            if is_little_endian:
+                i_compressed = iq_data_bytes[i * 2]
+                q_compressed = iq_data_bytes[i * 2 + 1]
+            else:
+                # Big-endian: swap byte order
+                i_compressed = iq_data_bytes[i * 2 + 1]
+                q_compressed = iq_data_bytes[i * 2]
             
-            # Convert unsigned to signed (0-255 -> -128 to 127)
-            i_val = (i_compressed - 128) * scale_factor
-            q_val = (q_compressed - 128) * scale_factor
+            # Convert to signed: if MSB is set, treat as negative (two's complement)
+            if i_compressed >= 128:
+                i_signed = i_compressed - 256
+            else:
+                i_signed = i_compressed
+            
+            if q_compressed >= 128:
+                q_signed = q_compressed - 256
+            else:
+                q_signed = q_compressed
+            
+            i_val = i_signed * scale_factor
+            q_val = q_signed * scale_factor
             
             samples.append(complex(i_val, q_val))
     elif 9 <= bits_per_sample <= 14:
@@ -130,9 +150,20 @@ def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
             # Read Q component (N bits)
             q_compressed, bit_offset = read_n_bits(bit_offset, bits_per_sample)
             
-            # Convert to signed (0 to max_value -> -signed_offset to signed_offset-1)
-            i_val = (i_compressed - signed_offset) * scale_factor
-            q_val = (q_compressed - signed_offset) * scale_factor
+            # Convert to signed using two's complement
+            # If MSB is set, treat as negative
+            if i_compressed >= signed_offset:
+                i_signed = i_compressed - (signed_offset * 2)
+            else:
+                i_signed = i_compressed
+            
+            if q_compressed >= signed_offset:
+                q_signed = q_compressed - (signed_offset * 2)
+            else:
+                q_signed = q_compressed
+            
+            i_val = i_signed * scale_factor
+            q_val = q_signed * scale_factor
             samples.append(complex(i_val, q_val))
     else:
         raise ValueError(f"Unsupported bits_per_sample: {bits_per_sample}. Supported range: 8-14")
@@ -182,7 +213,7 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
         
         bfp_bits = FORCE_BFP_BITWIDTH
         samples_per_rb = 12
-        max_rbs = 106  # Maximum RBs in 5G NR
+        max_rbs = MAX_RBS
         
         # In BFP, there's typically one exponent per Resource Block (RB)
         # Each RB has 12 subcarriers (samples)
@@ -282,11 +313,127 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
     
     return samples, compression_type, num_samples, exponents_list
 
+def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width):
+    """
+    Parse IQ samples from prb_raw list structure.
+    
+    Args:
+        prb_raw: List of lists, where each inner list contains [hex_string, offset, length, ...]
+        compression_method: Compression method (1 = BFP, 0 = uncompressed)
+        compression_width: Compression width in bits (for BFP: 8-14)
+    
+    Returns:
+        tuple: (samples_list, compression_type, num_samples, exponents_list)
+    """
+    samples = []
+    compression_type = "uncompressed"
+    exponents_list = None
+    
+    if not prb_raw or not isinstance(prb_raw, list):
+        return samples, compression_type, 0, exponents_list
+    
+    # Collect all hex strings from prb_raw
+    all_hex_data = []
+    for prb_entry in prb_raw:
+        if isinstance(prb_entry, list) and len(prb_entry) > 0:
+            hex_str = prb_entry[0]
+            if isinstance(hex_str, str):
+                # Remove spaces/colons and convert to bytes
+                hex_clean = hex_str.replace(':', '').replace(' ', '')
+                try:
+                    hex_bytes = bytes.fromhex(hex_clean)
+                    all_hex_data.append(hex_bytes)
+                except ValueError:
+                    continue
+    
+    if not all_hex_data:
+        return samples, compression_type, 0, exponents_list
+    
+    # Concatenate all hex data
+    iq_data_bytes = b''.join(all_hex_data)
+    
+    if len(iq_data_bytes) == 0:
+        return samples, compression_type, 0, exponents_list
+    
+    # Parse based on compression method
+    # compression_method: 1 = BFP, 0 = uncompressed
+    # Handle string input for backward compatibility
+    if isinstance(compression_method, str):
+        compression_method = 1 if compression_method.upper() == 'BFP' else 0
+    
+    if compression_method == 1:  # BFP compression
+        if compression_width < 8 or compression_width > 14:
+            compression_width = FORCE_BFP_BITWIDTH if FORCE_BFP_BITWIDTH else 9
+        
+        # Structure: Exponent (1 byte) + IQ data for RB, repeated for each RB
+        # Each RB has 12 samples
+        samples_per_rb = 12
+        
+        # Calculate bytes per RB for compressed data
+        if compression_width == 8:
+            bytes_per_sample = 2  # 1 byte I + 1 byte Q
+        else:
+            # For N-bit compression: (2*N) bits per sample
+            bytes_per_sample = (2 * compression_width) / 8
+        
+        bytes_per_rb = int(samples_per_rb * bytes_per_sample)
+        
+        # Parse interleaved structure: exponent (1 byte) + IQ data (bytes_per_rb bytes) per RB
+        exponents_list = []
+        all_compressed_data = []
+        offset = 0
+        max_rbs = MAX_RBS
+        
+        while offset < len(iq_data_bytes) and len(exponents_list) < max_rbs:
+            # Check if we have enough bytes for exponent + RB data
+            if offset + 1 + bytes_per_rb > len(iq_data_bytes):
+                break
+            
+            # Read exponent (1 byte)
+            exponent = int(iq_data_bytes[offset])
+            if exponent > 15:
+                # Invalid exponent, stop parsing
+                break
+            
+            exponents_list.append(exponent)
+            offset += 1
+            
+            # Read compressed IQ data for this RB
+            rb_data = iq_data_bytes[offset:offset + bytes_per_rb]
+            all_compressed_data.append((exponent, rb_data))
+            offset += bytes_per_rb
+        
+        if len(exponents_list) == 0:
+            # No valid RB data found
+            return samples, compression_type, 0, None
+        
+        # Decompress each RB's data with its own exponent
+        all_samples = []
+        for exponent, rb_compressed_data in all_compressed_data:
+            try:
+                rb_samples = decompress_bfp(rb_compressed_data, exponent, bits_per_sample=compression_width)
+                all_samples.extend(rb_samples)
+            except Exception as e:
+                print(f"BFP decompression failed for RB with exponent {exponent}: {e}")
+                # Continue with other RBs
+                continue
+        
+        samples = all_samples
+        compression_type = f"BFP_{compression_width}bit"
+    else:
+        # Uncompressed: 16-bit signed integers (big-endian)
+        num_samples = len(iq_data_bytes) // 4
+        if num_samples > 0:
+            iq_array = np.frombuffer(iq_data_bytes[:num_samples*4], dtype='>i2')
+            iq_reshaped = iq_array.reshape(num_samples, 2)
+            samples = (iq_reshaped[:, 0] + 1j * iq_reshaped[:, 1]).tolist()
+    
+    return samples, compression_type, len(samples), exponents_list
+
 def extract_oran_fh_data_from_packet(packet):
     """
     Extract ORAN FH CUS data from a pyshark packet.
     Returns the raw ORAN FH payload bytes, or None if not an ORAN FH packet.
-    ORAN FH uses UDP/IP with ports in range 49152-65535 (typically 49152-49215 for CUS).
     """
     try:
         # First, try to get data from ORAN FH CUS layer if it exists
@@ -327,66 +474,6 @@ def extract_oran_fh_data_from_packet(packet):
             except Exception as e:
                 print(f"Exception getting data from ORAN layer: {e}")
                 pass
-        
-        # Fallback: Try to get from UDP payload
-        if 'udp' not in packet:
-            return None
-        
-        udp = packet.udp
-        # Check if UDP port is in ORAN FH range (49152-65535, typically 49152-49215 for CUS)
-        try:
-            src_port = int(udp.srcport) if hasattr(udp, 'srcport') else None
-            dst_port = int(udp.dstport) if hasattr(udp, 'dstport') else None
-            
-            # ORAN FH uses ports in range 49152-65535
-            oran_port = None
-            if src_port and 49152 <= src_port <= 65535:
-                oran_port = src_port
-            elif dst_port and 49152 <= dst_port <= 65535:
-                oran_port = dst_port
-            
-            if not oran_port:
-                return None
-        except Exception as e:
-            print(f"Exception checking UDP port: {e}")
-            return None
-        
-        # Try to get UDP payload
-        try:
-            # Method 1: Try to get raw packet bytes
-            if hasattr(packet, 'frame_raw'):
-                raw_hex = packet.frame_raw.value
-                if raw_hex:
-                    raw_data = bytes.fromhex(raw_hex.replace(':', '').replace(' ', ''))
-                    # Find UDP header and extract payload
-                    # Ethernet (14) + IP (20) + UDP (8) = 42 bytes minimum
-                    if len(raw_data) > 42:
-                        # UDP payload starts after UDP header (8 bytes)
-                        # Need to find IP header length first
-                        ip_header_len = (raw_data[14] & 0x0F) * 4  # IP header length in bytes
-                        udp_start = 14 + ip_header_len
-                        if len(raw_data) > udp_start + 8:
-                            return raw_data[udp_start + 8:]  # Skip UDP header (8 bytes)
-            elif hasattr(packet, 'get_raw_packet'):
-                raw_data = packet.get_raw_packet()
-                if raw_data and len(raw_data) > 42:
-                    ip_header_len = (raw_data[14] & 0x0F) * 4
-                    udp_start = 14 + ip_header_len
-                    if len(raw_data) > udp_start + 8:
-                        return raw_data[udp_start + 8:]
-        except Exception as e:
-            print(f"Exception getting UDP payload (Method 1): {e}")
-            pass
-        
-        # Method 2: Try to get UDP payload from pyshark
-        try:
-            if hasattr(udp, 'payload'):
-                payload_hex = str(udp.payload)
-                if payload_hex:
-                    return bytes.fromhex(payload_hex.replace(':', '').replace(' ', ''))
-        except Exception as e:
-            print(f"Exception getting UDP payload (Method 2): {e}")
-            pass
         
         return None
     except Exception as e:
@@ -439,26 +526,6 @@ def get_oran_fh_cus_fields_from_packet(packet):
         # If we found the layer, try to extract fields from Wireshark's parsed data
         if oran_layer is not None:
 
-            # print oran_layer attributes
-            printAttrOranLayer = False
-            print_values = False  # Set to False to avoid printing attribute values
-            if printAttrOranLayer:
-                for attr in dir(oran_layer):
-                    if not attr.startswith('_'):
-                        try:
-                            val = getattr(oran_layer, attr)
-                            if print_values:
-                                print(f'oran_layer.{attr} = {val}')
-                            else:
-                                print(f'oran_layer.{attr}')
-                        except Exception as e:
-                            if print_values:
-                                print(f'oran_layer.{attr} = <error: {e}>')
-                            else:
-                                print(f'oran_layer.{attr} = <error>')
-
-            #print timing header
-            print(oran_layer.timingHeader_tree)
             # Try to get Timing Header Tree
             timing_header_tree = None
             for timing_path in ['timingHeader_tree', 'timing_header_tree']:
@@ -558,17 +625,6 @@ def get_oran_fh_cus_fields_from_packet(packet):
                     # Map section_tree attributes to our field names
                     # Based on the attributes: sectionId, numPrbu, startPrbu, rb, symInc, etc.
                     
-                    #print section tree attributes
-                    printAttrSectionTree = False
-                    if printAttrSectionTree:
-                        for attr in dir(section_tree):
-                            if not attr.startswith('_'):
-                                try:
-                                    val = getattr(section_tree, attr)
-                                    print(f'section_tree.{attr} = {val}')
-                                except Exception as e:
-                                    print(f'section_tree.{attr} = <error: {e}>')
-
                     # Section ID (section_id in section_tree)
                     if hasattr(section_tree, 'sectionId'):
                         try:
@@ -618,29 +674,15 @@ def get_oran_fh_cus_fields_from_packet(packet):
                         except (ValueError, TypeError, AttributeError):
                             pass
                     
-                    # Compression method
-                    if hasattr(section_tree, 'udCompHdrMeth'):
-                        try:
-                            val = section_tree.udCompHdrMeth
-                            if hasattr(val, 'get_default_value'):
-                                val = val.get_default_value()
-                            elif hasattr(val, 'show'):
-                                val = val.show
-                            fields['compression_method'] = int(val)
-                        except (ValueError, TypeError, AttributeError):
-                            pass
+                    # Compression method. Hardcoded from top variables
+                    # Convert string to integer: 'BFP' -> 1, 'uncompressed' -> 0
+                    if FORCE_COMPRESSION_TYPE.upper() == 'BFP':
+                        fields['compression_method'] = 1
+                    else:
+                        fields['compression_method'] = 0
                     
-                    # Compression width
-                    if hasattr(section_tree, 'udCompHdrWidth'):
-                        try:
-                            val = section_tree.udCompHdrWidth
-                            if hasattr(val, 'get_default_value'):
-                                val = val.get_default_value()
-                            elif hasattr(val, 'show'):
-                                val = val.show
-                            fields['compression_width'] = int(val)
-                        except (ValueError, TypeError, AttributeError):
-                            pass
+                    # Compression width. Hardcoded from top variables
+                    fields['compression_width'] = FORCE_BFP_BITWIDTH
                     
                 except Exception as e:
                     print(f"Exception parsing section_tree: {e}")
@@ -723,7 +765,6 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
     iq_data = defaultdict(lambda: {'UL': [], 'DL': [], 'metadata': []})
     # Track maximum uncompressed I/Q values per eAxC ID
     max_iq_values = defaultdict(lambda: {'max_i': 0, 'max_q': 0, 'max_abs': 0})
-    packet_count = 0
     
     print("Processing packets...")
     packet_count = 0
@@ -763,58 +804,48 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             
             
             # Get ORAN FH CUS fields from packet
-            if packet_count == 0:
-                packet_count += 1
-                continue;
-                
             fields = get_oran_fh_cus_fields_from_packet(packet)
 
             # If we couldn't parse ORAN FH fields, skip this packet
             if not fields:
-                print("no ORAN FH CUS fields found")
-                exit();
                 continue
-            else:
-                print("fields:")
-                print(fields)
-                exit();
             
-            # Extract ORAN FH CUS fields
-            section_id = fields.get('section_id', 0)  # Use section_id instead of eaxc_id
+            # Extract ORAN FH CUS fields using the actual field names from extraction
+            section_id = int(fields.get('sectionId', 0)) if 'sectionId' in fields else 0
             frame_id = fields.get('frame_id', 0)
             subframe_id = fields.get('subframe_id', 0)
             slot_id = fields.get('slot_id', 0)
             start_symbol_id = fields.get('start_symbol_id', 0)
-            num_symbols = fields.get('num_symbols', 1)
-            section_type = fields.get('section_type', 0)
-            section_extension = fields.get('section_extension', 0)
-            udp_port = fields.get('udp_port', 0)
-            direction_str = fields.get('direction', 'UNKNOWN')
+            # Calculate num_symbols from sym_inc or use default
+            sym_inc = fields.get('sym_inc', 0)
+            num_symbols = sym_inc + 1 if sym_inc > 0 else 1
+            start_prbc = fields.get('start_prbc', 0)
+            # Get compression method and width from fields (hardcoded from top variables)
+            # Default to BFP if not set
+            compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
+            compression_width = fields.get('compression_width', FORCE_BFP_BITWIDTH)
+            prb_raw = fields.get('prb_raw', None)
             
-            # Determine direction (TX = DL, RX = UL, or use section type)
-            # Section Type 1 = User Plane, Section Type 0 = Control Plane
-            if direction_str == 'TX':
-                direction = 'DL'
-            elif direction_str == 'RX':
-                direction = 'UL'
+            # Determine direction from data_direction field (1 = DL, 0 = UL)
+            data_direction = fields.get('data_direction', 1)
+            direction = 'DL' if data_direction == 1 else 'UL'
+            
+            # Extract IQ samples from prb_raw if available
+            if prb_raw is not None:
+                samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw(
+                    prb_raw, compression_method, compression_width)
             else:
-                # Default based on section type or use section_id to determine
-                direction = 'DL' if section_id % 2 == 0 else 'UL'
-            
-            # Get raw ORAN FH data
-            oran_data = extract_oran_fh_data_from_packet(packet)
-            if oran_data is None or len(oran_data) < 8:
-                continue
-            
-            # ORAN FH CUS header is at least 8 bytes, IQ data starts after header
-            # Header length depends on section type and extension
-            # For now, use a minimum offset - this may need adjustment based on actual packet structure
-            iq_offset = 8  # Minimum header size, may need to be larger based on section type
-            # Parse IQ samples (handles both uncompressed and BFP compressed)
-            # Note: ORAN FH may use different compression schemes - adjust parse_iq_samples as needed
-            samples, compression_type, num_samples, exponents_list = parse_iq_samples(
-                oran_data, iq_offset, 0, 0,  # payload_version and filter_index may not apply to ORAN
-                force_bfp=force_bfp, bfp_exponent=bfp_exponent)
+                # Fallback: try to get raw ORAN FH data
+                oran_data = extract_oran_fh_data_from_packet(packet)
+                if oran_data is None or len(oran_data) < 8:
+                    continue
+                
+                # ORAN FH CUS header is at least 8 bytes, IQ data starts after header
+                iq_offset = 8
+                # Parse IQ samples (handles both uncompressed and BFP compressed)
+                samples, compression_type, num_samples, exponents_list = parse_iq_samples(
+                    oran_data, iq_offset, 0, 0,
+                    force_bfp=force_bfp, bfp_exponent=bfp_exponent)
             
             # Store samples by section_id (equivalent to eAxC ID) and direction
             iq_data[section_id][direction].extend(samples)
@@ -839,16 +870,17 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             metadata_entry = {
                 'direction': direction,
                 'section_id': section_id,
-                'section_type': section_type,
-                'section_extension': section_extension,
-                'udp_port': udp_port,
                 'frame_id': frame_id,
                 'subframe_id': subframe_id,
                 'slot_id': slot_id,
                 'start_symbol_id': start_symbol_id,
                 'num_symbols': num_symbols,
+                'start_prbc': start_prbc,
+                'sym_inc': sym_inc,
                 'num_samples': num_samples,
-                'compression_type': compression_type
+                'compression_type': compression_type,
+                'compression_method': compression_method,
+                'compression_width': compression_width
             }
             
             # Add RB exponents array if BFP compression is used
@@ -856,6 +888,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                 metadata_entry['rb_exponents'] = rb_exponents
             
             iq_data[section_id]['metadata'].append(metadata_entry)
+            packet_count += 1
             
         except Exception as e:
             # Skip packets that cause errors
@@ -1477,7 +1510,7 @@ def plot_resource_allocation(analysis_data, pcap_file):
     eaxc_list = sorted(analysis_data['eaxc_ids'])
     
     samples_per_rb = 12
-    max_rbs_limit = 106
+    max_rbs_limit = MAX_RBS
     
     # Get base name and directory for output files
     # Create Plots directory in the workspace root (IQAnalysis folder)
@@ -1512,10 +1545,10 @@ def plot_resource_allocation(analysis_data, pcap_file):
                                 combo = (frame_id, subframe_id, slot_id, symbol_id)
                                 unique_combinations.append(combo)
                                 
-                                expected_samples_for_106_rbs = 106 * 12
+                                expected_samples_for_max_rbs = MAX_RBS * 12
                                 
-                                if total_samples > expected_samples_for_106_rbs * 1.5:
-                                    ratio = expected_samples_for_106_rbs / total_samples
+                                if total_samples > expected_samples_for_max_rbs * 1.5:
+                                    ratio = expected_samples_for_max_rbs / total_samples
                                     estimated_active_subcarriers = total_samples * ratio
                                     num_rbs = int(np.ceil(estimated_active_subcarriers / samples_per_rb))
                                 else:
@@ -1531,7 +1564,7 @@ def plot_resource_allocation(analysis_data, pcap_file):
         # Find maximum number of RBs across all combinations
         max_rbs = max(combo_data['rbs'] for combo_data in combination_data.values())
         
-        # Cap at maximum RBs (106 for 5G NR)
+        # Cap at maximum RBs
         if max_rbs > max_rbs_limit:
             max_rbs = max_rbs_limit
         
