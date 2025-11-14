@@ -1377,6 +1377,10 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     
     print(f"Found {total_packets} total packets\n")
     
+    # Helper function to create a new dict with a new set for rbs_with_data
+    def make_frame_slot_data():
+        return {'packets': 0, 'samples': 0, 'start_prbc': None, 'num_prbc': None, 'rbs_with_data': set()}
+    
     # Collect analysis data
     analysis_data = {
         'eaxc_ids': set(),  # Using RU Port ID as eaxc_id
@@ -1397,7 +1401,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
         'overall_symbol_samples': defaultdict(int),  # Track total samples per overall symbol when filtering
         'symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0})),
         'slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(int))),
-        'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0, 'start_prbc': None, 'num_prbc': None}))))),
+        'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(make_frame_slot_data))))),
         'compression_types': set(),
         'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
         'max_num_prbc': 0  # Track maximum num_prbc seen across all packets
@@ -1588,6 +1592,25 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
                 frame_slot_data['start_prbc'] = start_prbc
             if frame_slot_data['num_prbc'] is None:
                 frame_slot_data['num_prbc'] = num_prbc
+            
+            # Track which RBs have non-zero IQ data (12 samples per RB)
+            if len(samples) > 0:
+                samples_per_rb = 12
+                num_rbs_in_samples = len(samples) // samples_per_rb
+                
+                # Check each RB to see if it has any non-zero samples
+                for rb_idx in range(num_rbs_in_samples):
+                    rb_start = rb_idx * samples_per_rb
+                    rb_end = rb_start + samples_per_rb
+                    rb_samples = samples[rb_start:rb_end]
+                    
+                    # Check if any sample in this RB is non-zero
+                    has_nonzero = any(abs(s) > 1e-10 for s in rb_samples)  # Use small epsilon for float comparison
+                    
+                    if has_nonzero:
+                        # Store the actual RB index (start_prbc + rb_idx)
+                        actual_rb_index = start_prbc + rb_idx
+                        frame_slot_data['rbs_with_data'].add(actual_rb_index)
             
         except Exception as e:
             continue
@@ -1819,7 +1842,10 @@ def plot_resource_allocation(analysis_data, pcap_file):
                                 
                                 if num_rbs > max_rbs_limit:
                                     num_rbs = max_rbs_limit
-                                combination_data[combo] = {'samples': total_samples, 'rbs': num_rbs, 'packets': packet_count, 'start_prbc': start_prbc_val}
+                                
+                                # Get RBs with data for this combination
+                                rbs_with_data = symbol_data.get('rbs_with_data', set())
+                                combination_data[combo] = {'samples': total_samples, 'rbs': num_rbs, 'packets': packet_count, 'start_prbc': start_prbc_val, 'rbs_with_data': rbs_with_data}
         
         if len(unique_combinations) == 0:
             continue  # Skip this eAxC ID if no data
@@ -1857,11 +1883,20 @@ def plot_resource_allocation(analysis_data, pcap_file):
             num_rbs_for_combo = combo_info['rbs']
             start_prbc_val = combo_info.get('start_prbc', 0)
             
-            # Mark RBs from start_prbc to start_prbc + num_rbs - 1
-            for rb_offset in range(num_rbs_for_combo):
-                rb_index = start_prbc_val + rb_offset
-                if rb_index < max_rbs:
-                    grid[rb_index, col_idx] = rb_index + 1  # Each RB gets its actual index + 1
+            # Only mark RBs that have non-zero IQ data
+            rbs_with_data = combo_info.get('rbs_with_data', set())
+            if not rbs_with_data:
+                # Fallback: if rbs_with_data not tracked, mark all RBs in the allocated range
+                # (for backward compatibility with data processed before this change)
+                for rb_offset in range(num_rbs_for_combo):
+                    rb_index = start_prbc_val + rb_offset
+                    if rb_index < max_rbs:
+                        grid[rb_index, col_idx] = rb_index + 1
+            else:
+                # Only mark RBs that have actual non-zero data
+                for rb_index in rbs_with_data:
+                    if rb_index < max_rbs:
+                        grid[rb_index, col_idx] = rb_index + 1  # Each RB gets its actual index + 1
         
         # Create colormap - each RB gets a distinct color
         unallocated_color = '#f0f0f0'  # Light gray for unallocated
