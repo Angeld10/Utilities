@@ -502,6 +502,7 @@ def get_oran_fh_cus_fields_from_packet(packet):
     - Section Type (1 byte)
     - Section Extension (1 byte) 
     - Section ID (2 bytes)
+    - RU Port ID (1 byte)
     - Frame ID (1 byte)
     - Subframe ID (1 byte)
     - Slot ID (1 byte)
@@ -539,6 +540,30 @@ def get_oran_fh_cus_fields_from_packet(packet):
         # If we found the layer, try to extract fields from Wireshark's parsed data
         if oran_layer is not None:
 
+            #Try to get RU Port ID
+            ecpri_header_tree = None
+            for ecpri_path in ['ecpriRtcid', 'ecpriRtcid_raw']:
+                try:
+                    ecpri_header_tree = getattr(oran_layer, ecpri_path, None)
+                    if ecpri_header_tree is not None:
+                        break
+                except (AttributeError, TypeError):
+                    continue
+
+            if ecpri_header_tree is not None:
+                try:
+                    val = ecpri_header_tree.ruPortId
+                    if hasattr(val, 'get_default_value'):
+                        val = val.get_default_value()
+                    elif hasattr(val, 'show'):
+                        val = val.show
+                    fields['ru_port_id'] = int(val)
+                except (ValueError, TypeError, AttributeError):
+                    try:
+                        val = int(ecpri_header_tree.ruPortId_raw[0])
+                        fields['ru_port_id'] = val
+                    except (ValueError, TypeError, AttributeError):
+                        pass
             # Try to get Timing Header Tree
             timing_header_tree = None
             for timing_path in ['timingHeader_tree', 'timing_header_tree']:
@@ -825,6 +850,9 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             
             # Extract ORAN FH CUS fields using the actual field names from extraction
             section_id = int(fields.get('sectionId', 0)) if 'sectionId' in fields else 0
+            # Use RU Port ID as eAxC ID (not section_id)
+            ru_port_id = fields.get('ru_port_id', 0) if 'ru_port_id' in fields else 0
+            eaxc_id = ru_port_id  # Use RU Port ID as eAxC ID
             frame_id = fields.get('frame_id', 0)
             subframe_id = fields.get('subframe_id', 0)
             slot_id = fields.get('slot_id', 0)
@@ -860,18 +888,18 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                     oran_data, iq_offset, 0, 0,
                     force_bfp=force_bfp, bfp_exponent=bfp_exponent)
             
-            # Store samples by section_id (equivalent to eAxC ID) and direction
-            iq_data[section_id][direction].extend(samples)
+            # Store samples by eAxC ID (RU Port ID) and direction
+            iq_data[eaxc_id][direction].extend(samples)
             
             # Track maximum uncompressed I/Q values for this eAxC ID
             if len(samples) > 0:
                 max_i, max_q, max_abs = calculate_max_iq(samples)
                 
-                # Update maximums for this section_id
-                if max_abs > max_iq_values[section_id]['max_abs']:
-                    max_iq_values[section_id]['max_i'] = max_i
-                    max_iq_values[section_id]['max_q'] = max_q
-                    max_iq_values[section_id]['max_abs'] = max_abs
+                # Update maximums for this eAxC ID
+                if max_abs > max_iq_values[eaxc_id]['max_abs']:
+                    max_iq_values[eaxc_id]['max_i'] = max_i
+                    max_iq_values[eaxc_id]['max_q'] = max_q
+                    max_iq_values[eaxc_id]['max_abs'] = max_abs
             
             # Use the exponents list directly if BFP (already one per RB)
             rb_exponents = None
@@ -882,7 +910,9 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             # Store metadata for this packet (ORAN FH CUS format)
             metadata_entry = {
                 'direction': direction,
-                'section_id': section_id,
+                'eaxc_id': eaxc_id,  # RU Port ID used as eAxC ID
+                'section_id': section_id,  # Keep section_id for reference, but don't use as eAxC ID
+                'ru_port_id': ru_port_id,
                 'frame_id': frame_id,
                 'subframe_id': subframe_id,
                 'slot_id': slot_id,
@@ -900,7 +930,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             if rb_exponents is not None:
                 metadata_entry['rb_exponents'] = rb_exponents
             
-            iq_data[section_id]['metadata'].append(metadata_entry)
+            iq_data[eaxc_id]['metadata'].append(metadata_entry)
             packet_count += 1
             
         except Exception as e:
@@ -918,25 +948,25 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
     total_ul = 0
     total_dl = 0
     
-    for section_id in sorted(iq_data.keys()):
-        ul_samples = len(iq_data[section_id]['UL'])
-        dl_samples = len(iq_data[section_id]['DL'])
-        max_iq = max_iq_values[section_id]['max_abs']
+    for eaxc_id in sorted(iq_data.keys()):
+        ul_samples = len(iq_data[eaxc_id]['UL'])
+        dl_samples = len(iq_data[eaxc_id]['DL'])
+        max_iq = max_iq_values[eaxc_id]['max_abs']
         
         if ul_samples > 0:
-            ul_packets = sum(1 for m in iq_data[section_id]['metadata'] if m['direction'] == 'UL')
+            ul_packets = sum(1 for m in iq_data[eaxc_id]['metadata'] if m['direction'] == 'UL')
             max_iq_str = f"{max_iq:.0f}" if max_iq > 0 else "N/A"
             dbfs = calculate_dbfs(max_iq)
             dbfs_str = f"{dbfs:.1f} dBFS" if dbfs is not None else "N/A"
-            print(f"{section_id:<10} {'UL':<12} {ul_samples:<15,} {ul_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
+            print(f"{eaxc_id:<10} {'UL':<12} {ul_samples:<15,} {ul_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
             total_ul += ul_samples
         
         if dl_samples > 0:
-            dl_packets = sum(1 for m in iq_data[section_id]['metadata'] if m['direction'] == 'DL')
+            dl_packets = sum(1 for m in iq_data[eaxc_id]['metadata'] if m['direction'] == 'DL')
             max_iq_str = f"{max_iq:.0f}" if max_iq > 0 else "N/A"
             dbfs = calculate_dbfs(max_iq)
             dbfs_str = f"{dbfs:.1f} dBFS" if dbfs is not None else "N/A"
-            print(f"{section_id:<10} {'DL':<12} {dl_samples:<15,} {dl_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
+            print(f"{eaxc_id:<10} {'DL':<12} {dl_samples:<15,} {dl_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
             total_dl += dl_samples
     
     print("=" * 110)
@@ -1293,7 +1323,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
     
     # Collect analysis data
     analysis_data = {
-        'eaxc_ids': set(),
+        'eaxc_ids': set(),  # Using RU Port ID as eaxc_id
         'directions': set(),
         'frames': set(),
         'subframes': set(),
@@ -1313,31 +1343,41 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
     
     for packet in cap:
         try:
-            # Get eCPRI fields from Wireshark's parsed data
-            fields = get_ecpri_fields_from_packet(packet)
+            # Skip non-ORAN FH packets early
+            # Check if packet has ORAN_FH_CUS layer
+            has_oran_fh_cus = False
             
-            # If Wireshark didn't parse it, try manual extraction
+            # First, try checking with 'in' operator (pyshark typically uses lowercase)
+            layer_checks = ['oran_fh_cus', 'ORAN_FH_CUS', 'oran', 'ORAN']
+            for layer_name in layer_checks:
+                try:
+                    if layer_name in packet:
+                        has_oran_fh_cus = True
+                        break
+                except:
+                    pass
+            
+            # Also check all layer names directly (more reliable)
+            if not has_oran_fh_cus and hasattr(packet, 'layers'):
+                for layer in packet.layers:
+                    layer_name = layer.layer_name
+                    layer_name_lower = layer_name.lower()
+                    # Check for ORAN_FH_CUS or similar
+                    if 'oran' in layer_name_lower and 'fh' in layer_name_lower:
+                        has_oran_fh_cus = True
+                        break
+                    elif 'oran' in layer_name_lower or 'fh_cus' in layer_name_lower or 'cus' in layer_name_lower:
+                        has_oran_fh_cus = True
+                        break
+            
+            if not has_oran_fh_cus:
+                continue
+            
+            # Get ORAN FH CUS fields from packet
+            fields = get_oran_fh_cus_fields_from_packet(packet)
+            
+            # If we couldn't parse ORAN FH fields, skip this packet
             if not fields:
-                ecpri_data = extract_ecpri_data_from_packet(packet)
-                if ecpri_data is None or len(ecpri_data) < 16:
-                    continue
-                
-                # Parse manually
-                fields = {}
-                fields['msg_type'] = ecpri_data[1]
-                fields['eaxc_id'] = struct.unpack('!H', ecpri_data[4:6])[0]
-                radio_start = 8
-                if len(ecpri_data) > radio_start + 7:
-                    fields['data_direction'] = (ecpri_data[radio_start] >> 7) & 0x01
-                    fields['payload_version'] = (ecpri_data[radio_start] >> 4) & 0x07
-                    fields['filter_index'] = ecpri_data[radio_start] & 0x0F
-                    fields['frame_id'] = ecpri_data[radio_start + 1]
-                    fields['subframe_id'] = (ecpri_data[radio_start + 2] >> 4) & 0x0F
-                    fields['slot_id'] = ((ecpri_data[radio_start + 2] & 0x0F) << 2) | ((ecpri_data[radio_start + 3] >> 6) & 0x03)
-                    fields['symbol_id'] = ecpri_data[radio_start + 3] & 0x3F
-            
-            # Check if this is an IQ data message (type 0x00)
-            if fields.get('msg_type', -1) != 0x00:
                 continue
             
             analysis_data['packet_count'] += 1
@@ -1350,29 +1390,45 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
             except:
                 pass
             
-            # Extract fields
-            eaxc_id = fields.get('eaxc_id', 0)
-            data_direction = fields.get('data_direction', 0)
-            payload_version = fields.get('payload_version', 0)
-            filter_index = fields.get('filter_index', 0)
+            # Extract ORAN FH CUS fields using the actual field names from extraction
+            section_id = int(fields.get('sectionId', 0)) if 'sectionId' in fields else 0
+            # Use RU Port ID as eAxC ID (not section_id)
+            ru_port_id = fields.get('ru_port_id', 0) if 'ru_port_id' in fields else 0
+            eaxc_id = ru_port_id  # Use RU Port ID as eAxC ID
             frame_id = fields.get('frame_id', 0)
             subframe_id = fields.get('subframe_id', 0)
             slot_id = fields.get('slot_id', 0)
-            symbol_id = fields.get('symbol_id', 0)
+            start_symbol_id = fields.get('start_symbol_id', 0)
+            # Calculate num_symbols from sym_inc or use default
+            sym_inc = fields.get('sym_inc', 0)
+            num_symbols = sym_inc + 1 if sym_inc > 0 else 1
+            start_prbc = fields.get('start_prbc', 0)
+            # Get compression method and width from fields (hardcoded from top variables)
+            # Default to BFP if not set
+            compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
+            compression_width = fields.get('compression_width', FORCE_BFP_BITWIDTH)
+            prb_raw = fields.get('prb_raw', None)
             
+            # Determine direction from data_direction field (1 = DL, 0 = UL)
+            data_direction = fields.get('data_direction', 1)
             direction = 'DL' if data_direction == 1 else 'UL'
             
-            # Get raw eCPRI data
-            ecpri_data = extract_ecpri_data_from_packet(packet)
-            if ecpri_data is None or len(ecpri_data) < 16:
-                continue
-            
-            # Skip headers to get IQ data
-            iq_offset = 16
-            # Parse IQ samples (handles both uncompressed and BFP compressed)
-            samples, compression_type, num_samples, exponents_list = parse_iq_samples(
-                ecpri_data, iq_offset, payload_version, filter_index, 
-                force_bfp=force_bfp, bfp_exponent=bfp_exponent)
+            # Extract IQ samples from prb_raw if available
+            if prb_raw is not None:
+                samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw(
+                    prb_raw, compression_method, compression_width)
+            else:
+                # Fallback: try to get raw ORAN FH data
+                oran_data = extract_oran_fh_data_from_packet(packet)
+                if oran_data is None or len(oran_data) < 8:
+                    continue
+                
+                # ORAN FH CUS header is at least 8 bytes, IQ data starts after header
+                iq_offset = 8
+                # Parse IQ samples (handles both uncompressed and BFP compressed)
+                samples, compression_type, num_samples, exponents_list = parse_iq_samples(
+                    oran_data, iq_offset, 0, 0,
+                    force_bfp=force_bfp, bfp_exponent=bfp_exponent)
             
             # Track compression type
             analysis_data['compression_types'].add(compression_type)
@@ -1387,22 +1443,22 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None):
                     analysis_data['max_iq_values'][eaxc_id]['max_q'] = max_q
                     analysis_data['max_iq_values'][eaxc_id]['max_abs'] = max_abs
             
-            # Update statistics
+            # Update statistics (using RU Port ID as eaxc_id)
             analysis_data['eaxc_ids'].add(eaxc_id)
             analysis_data['directions'].add(direction)
             analysis_data['frames'].add(frame_id)
             analysis_data['subframes'].add(subframe_id)
             analysis_data['slots'].add(slot_id)
-            analysis_data['symbols'].add(symbol_id)
+            analysis_data['symbols'].add(start_symbol_id)
             analysis_data['total_samples'] += num_samples
             analysis_data['eaxc_stats'][eaxc_id][direction]['packets'] += 1
             analysis_data['eaxc_stats'][eaxc_id][direction]['samples'] += num_samples
-            analysis_data['symbol_counts'][symbol_id] += 1
-            analysis_data['symbol_eaxc_data'][symbol_id][eaxc_id]['packets'] += 1
-            analysis_data['symbol_eaxc_data'][symbol_id][eaxc_id]['samples'] += num_samples
-            analysis_data['slot_symbol_eaxc_data'][slot_id][symbol_id][eaxc_id] += 1
-            analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id][eaxc_id]['packets'] += 1
-            analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id][eaxc_id]['samples'] += num_samples
+            analysis_data['symbol_counts'][start_symbol_id] += 1
+            analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['packets'] += 1
+            analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['samples'] += num_samples
+            analysis_data['slot_symbol_eaxc_data'][slot_id][start_symbol_id][eaxc_id] += 1
+            analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][start_symbol_id][eaxc_id]['packets'] += 1
+            analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][start_symbol_id][eaxc_id]['samples'] += num_samples
             
         except Exception as e:
             continue
