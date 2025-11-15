@@ -350,13 +350,14 @@ def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width, max_rb
         if isinstance(prb_entry, list) and len(prb_entry) > 0:
             hex_str = prb_entry[0]
             if isinstance(hex_str, str):
-                # Remove spaces/colons and convert to bytes
-                hex_clean = hex_str.replace(':', '').replace(' ', '')
+                # Optimize: Use translate/str.maketrans for faster character removal (or regex for one pass)
+                # Remove spaces/colons in one pass using translate (faster than multiple replace calls)
+                hex_clean = hex_str.translate(str.maketrans('', '', ': '))
                 try:
                     hex_bytes = bytes.fromhex(hex_clean)
                     all_hex_data.append(hex_bytes)
                 except ValueError:
-                    Continue
+                    continue
 
     if not all_hex_data:
         return samples, compression_type, 0, exponents_list
@@ -813,13 +814,15 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
         # Try without display filter first, then filter in Python
         # Display filters can cause issues with some TShark versions
         try:
-            cap = pyshark.FileCapture(pcap_file, use_json=True, include_raw=True)
+            # Optimization: Use keep_packets=False to avoid storing all packets in memory
+            # This significantly speeds up processing for large PCAP files
+            cap = pyshark.FileCapture(pcap_file, use_json=True, include_raw=True, keep_packets=False)
         except:
             try:
-                cap = pyshark.FileCapture(pcap_file, use_json=True)
+                cap = pyshark.FileCapture(pcap_file, use_json=True, keep_packets=False)
             except:
                 # Fallback to basic capture
-                cap = pyshark.FileCapture(pcap_file)
+                cap = pyshark.FileCapture(pcap_file, keep_packets=False)
     except Exception as e:
         print(f"Error opening pcap file: {e}")
         return {}, {}, 0
@@ -861,36 +864,57 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
     
     print("Processing packets...")
     total_packets = 0
+    # Cache the layer name after first successful detection to speed up subsequent packets
+    cached_layer_name = None
+    
     for packet in cap:
         total_packets += 1  # Count all packets (single pass)
         try:
             # Skip non-ORAN FH packets early
-            # Check if packet has ORAN_FH_CUS layer
-            # pyshark layer names can vary, so check both 'in' operator and layer names directly
+            # Use cached layer name if available (optimization)
             has_oran_fh_cus = False
-            
-            # First, try checking with 'in' operator (pyshark typically uses lowercase)
-            layer_checks = ['oran_fh_cus', 'ORAN_FH_CUS', 'oran', 'ORAN']
-            for layer_name in layer_checks:
+            if cached_layer_name:
                 try:
-                    if layer_name in packet:
+                    if cached_layer_name in packet:
                         has_oran_fh_cus = True
-                        break
                 except:
-                    pass
+                    cached_layer_name = None  # Cache invalidated, reset
             
-            # Also check all layer names directly (more reliable)
-            if not has_oran_fh_cus and hasattr(packet, 'layers'):
-                for layer in packet.layers:
-                    layer_name = layer.layer_name
-                    layer_name_lower = layer_name.lower()
-                    # Check for ORAN_FH_CUS or similar
-                    if 'oran' in layer_name_lower and 'fh' in layer_name_lower:
-                        has_oran_fh_cus = True
-                        break
-                    elif 'oran' in layer_name_lower or 'fh_cus' in layer_name_lower or 'cus' in layer_name_lower:
-                        has_oran_fh_cus = True
-                        break
+            if not has_oran_fh_cus:
+                # First, try checking with 'in' operator (pyshark typically uses lowercase)
+                layer_checks = ['oran_fh_cus', 'ORAN_FH_CUS', 'oran', 'ORAN']
+                for layer_name in layer_checks:
+                    try:
+                        if layer_name in packet:
+                            has_oran_fh_cus = True
+                            cached_layer_name = layer_name  # Cache for next packets
+                            break
+                    except:
+                        pass
+                
+                # Also check all layer names directly (more reliable)
+                if not has_oran_fh_cus and hasattr(packet, 'layers'):
+                    for layer in packet.layers:
+                        layer_name = layer.layer_name
+                        layer_name_lower = layer_name.lower()
+                        # Check for ORAN_FH_CUS or similar
+                        if 'oran' in layer_name_lower and 'fh' in layer_name_lower:
+                            has_oran_fh_cus = True
+                            # Cache the actual layer name for faster lookups
+                            try:
+                                if layer_name in packet:
+                                    cached_layer_name = layer_name
+                            except:
+                                pass
+                            break
+                        elif 'oran' in layer_name_lower or 'fh_cus' in layer_name_lower or 'cus' in layer_name_lower:
+                            has_oran_fh_cus = True
+                            try:
+                                if layer_name in packet:
+                                    cached_layer_name = layer_name
+                            except:
+                                pass
+                            break
             
             if not has_oran_fh_cus:
                 continue
@@ -999,7 +1023,9 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                     force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
             
             # Store samples by eAxC ID (RU Port ID) and direction
-            iq_data[eaxc_id][direction].extend(samples)
+            # Optimization: Only extend if samples exist (minor optimization)
+            if len(samples) > 0:
+                iq_data[eaxc_id][direction].extend(samples)
             
             # Track compression type
             analysis_data['compression_types'].add(compression_type)
@@ -1091,21 +1117,23 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                 frame_slot_data['num_prbc'] = num_prbc
             
             # Track which RBs have non-zero IQ data (12 samples per RB)
+            # Optimized: Use numpy for faster non-zero detection
             if len(samples) > 0:
                 samples_per_rb = 12
                 num_rbs_in_samples = len(samples) // samples_per_rb
                 
-                # Check each RB to see if it has any non-zero samples
-                for rb_idx in range(num_rbs_in_samples):
-                    rb_start = rb_idx * samples_per_rb
-                    rb_end = rb_start + samples_per_rb
-                    rb_samples = samples[rb_start:rb_end]
+                if num_rbs_in_samples > 0:
+                    # Convert samples to numpy array once for efficient processing
+                    samples_array = np.array(samples[:num_rbs_in_samples * samples_per_rb], dtype=complex)
+                    # Reshape to [num_rbs, samples_per_rb] for batch processing
+                    rb_samples_2d = samples_array.reshape(num_rbs_in_samples, samples_per_rb)
+                    # Compute magnitude for each sample, then check if any sample per RB is non-zero
+                    # This is much faster than looping and using 'any()' for each RB
+                    magnitudes = np.abs(rb_samples_2d)
+                    has_nonzero_per_rb = np.any(magnitudes > 1e-10, axis=1)
                     
-                    # Check if any sample in this RB is non-zero
-                    has_nonzero = any(abs(s) > 1e-10 for s in rb_samples)  # Use small epsilon for float comparison
-                    
-                    if has_nonzero:
-                        # Store the actual RB index (start_prbc + rb_idx)
+                    # Only iterate through RBs that have non-zero data
+                    for rb_idx in np.where(has_nonzero_per_rb)[0]:
                         actual_rb_index = start_prbc + rb_idx
                         frame_slot_data['rbs_with_data'].add(actual_rb_index)
             
@@ -1854,21 +1882,23 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
                 frame_slot_data['num_prbc'] = num_prbc
             
             # Track which RBs have non-zero IQ data (12 samples per RB)
+            # Optimized: Use numpy for faster non-zero detection
             if len(samples) > 0:
                 samples_per_rb = 12
                 num_rbs_in_samples = len(samples) // samples_per_rb
                 
-                # Check each RB to see if it has any non-zero samples
-                for rb_idx in range(num_rbs_in_samples):
-                    rb_start = rb_idx * samples_per_rb
-                    rb_end = rb_start + samples_per_rb
-                    rb_samples = samples[rb_start:rb_end]
+                if num_rbs_in_samples > 0:
+                    # Convert samples to numpy array once for efficient processing
+                    samples_array = np.array(samples[:num_rbs_in_samples * samples_per_rb], dtype=complex)
+                    # Reshape to [num_rbs, samples_per_rb] for batch processing
+                    rb_samples_2d = samples_array.reshape(num_rbs_in_samples, samples_per_rb)
+                    # Compute magnitude for each sample, then check if any sample per RB is non-zero
+                    # This is much faster than looping and using 'any()' for each RB
+                    magnitudes = np.abs(rb_samples_2d)
+                    has_nonzero_per_rb = np.any(magnitudes > 1e-10, axis=1)
                     
-                    # Check if any sample in this RB is non-zero
-                    has_nonzero = any(abs(s) > 1e-10 for s in rb_samples)  # Use small epsilon for float comparison
-                    
-                    if has_nonzero:
-                        # Store the actual RB index (start_prbc + rb_idx)
+                    # Only iterate through RBs that have non-zero data
+                    for rb_idx in np.where(has_nonzero_per_rb)[0]:
                         actual_rb_index = start_prbc + rb_idx
                         frame_slot_data['rbs_with_data'].add(actual_rb_index)
             
