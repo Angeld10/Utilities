@@ -787,11 +787,26 @@ def get_oran_fh_cus_fields_from_packet(packet):
         print(f"Exception in get_oran_fh_cus_fields_from_packet: {e}")
         return None
 
-def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
-    """Extract IQ samples with direction and eAxC ID information using pyshark"""
+def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False):
+    """Extract IQ samples with direction and eAxC ID information using pyshark.
+    Also collects analysis statistics for reporting.
+    
+    Returns:
+        tuple: (iq_data, analysis_data, total_packets)
+    """
     # Normalize path to handle relative paths correctly
     pcap_file = os.path.normpath(os.path.abspath(pcap_file))
     print(f"Reading {pcap_file} with pyshark...")
+    
+    # 5G NR typically has 14 symbols per slot (for normal cyclic prefix)
+    SYMBOLS_PER_SLOT = 14
+    # 5G NR has 10 subframes per frame
+    SUBFRAMES_PER_FRAME = 10
+    # Slots per subframe depends on numerology (0 = 1 slot, 1 = 2 slots)
+    SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
+    
+    # Track the first (frame, subframe, slot) combination for filtering
+    first_frame_subframe_slot = None
     
     try:
         # Open pcap file with pyshark
@@ -807,18 +822,47 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                 cap = pyshark.FileCapture(pcap_file)
     except Exception as e:
         print(f"Error opening pcap file: {e}")
-        return {}
+        return {}, {}, 0
+    
+    # Helper function to create a new dict with a new set for rbs_with_data
+    def make_frame_slot_data():
+        return {'packets': 0, 'samples': 0, 'start_prbc': None, 'num_prbc': None, 'rbs_with_data': set()}
     
     # Organize by eAxC ID and direction
     iq_data = defaultdict(lambda: {'UL': [], 'DL': [], 'metadata': []})
     # Track maximum uncompressed I/Q values per eAxC ID
     max_iq_values = defaultdict(lambda: {'max_i': 0, 'max_q': 0, 'max_abs': 0})
-    # Track maximum num_prbc seen across all packets (dynamically determined)
-    max_num_prbc = 0
+    
+    # Collect analysis data (same structure as analyze_pcap)
+    analysis_data = {
+        'eaxc_ids': set(),  # Using RU Port ID as eaxc_id
+        'directions': set(),
+        'frames': set(),
+        'subframes': set(),
+        'slots': set(),
+        'slots_seen_in_fields': set(),
+        'symbols': set(),
+        'packet_timestamps': [],
+        'packet_count': 0,
+        'total_samples': 0,
+        'eaxc_stats': defaultdict(lambda: {'UL': {'packets': 0, 'samples': 0}, 'DL': {'packets': 0, 'samples': 0}}),
+        'symbol_counts': defaultdict(int),
+        'overall_symbol_counts': defaultdict(int),
+        'overall_symbol_unique_combos': defaultdict(set),
+        'overall_symbol_eaxc_counts': defaultdict(lambda: defaultdict(int)),
+        'overall_symbol_samples': defaultdict(int),
+        'symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: {'packets': 0, 'samples': 0})),
+        'slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(int))),
+        'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(make_frame_slot_data))))),
+        'compression_types': set(),
+        'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
+        'max_num_prbc': 0
+    }
     
     print("Processing packets...")
-    packet_count = 0
+    total_packets = 0
     for packet in cap:
+        total_packets += 1  # Count all packets (single pass)
         try:
             # Skip non-ORAN FH packets early
             # Check if packet has ORAN_FH_CUS layer
@@ -849,9 +893,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                         break
             
             if not has_oran_fh_cus:
-                print("no ORAN FH CUS layer found")
                 continue
-            
             
             # Get ORAN FH CUS fields from packet
             fields = get_oran_fh_cus_fields_from_packet(packet)
@@ -869,10 +911,63 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             subframe_id = fields.get('subframe_id', 0)
             slot_id = fields.get('slot_id', 0)
             start_symbol_id = fields.get('start_symbol_id', 0)
+            
+            # Track ALL slots seen in fields extraction (before filtering)
+            analysis_data['slots_seen_in_fields'].add(slot_id)
+            
+            # Calculate overall symbol number: count continuously across frames, subframes, slots, and symbols
+            overall_symbol = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                            (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                            (slot_id * SYMBOLS_PER_SLOT) + \
+                            start_symbol_id
+            
+            # Filter by overall symbol number if specified (must happen BEFORE incrementing packet_count)
+            if start_symbol is not None or end_symbol is not None:
+                # Check overall symbol range first
+                if start_symbol is not None and overall_symbol < start_symbol:
+                    continue
+                if end_symbol is not None and overall_symbol > end_symbol:
+                    continue
+                
+                # Only restrict to first frame/subframe/slot when using --symbols (not --start-symbol/--end-symbol)
+                if restrict_to_first_combo:
+                    # Identify the first (frame, subframe, slot) combination that matches the range
+                    if first_frame_subframe_slot is None:
+                        first_frame_subframe_slot = (frame_id, subframe_id, slot_id)
+                    
+                    # Only include packets from the first frame/subframe/slot combination
+                    current_combo = (frame_id, subframe_id, slot_id)
+                    if current_combo != first_frame_subframe_slot:
+                        continue  # Skip packets not from the first frame/subframe/slot
+            
+            # Increment packet count only after filtering - this should match the sum of overall_symbol_counts
+            analysis_data['packet_count'] += 1
+            
+            # Get packet timestamp
+            try:
+                if hasattr(packet, 'sniff_timestamp'):
+                    timestamp = float(packet.sniff_timestamp)
+                    analysis_data['packet_timestamps'].append(timestamp)
+            except:
+                pass
+            
             # Calculate num_symbols from sym_inc or use default
             sym_inc = fields.get('sym_inc', 0)
             num_symbols = sym_inc + 1 if sym_inc > 0 else 1
             start_prbc = fields.get('start_prbc', 0)
+            # Get num_prbc from fields (dynamically determined from ORAN section tree)
+            num_prbc = fields.get('num_prbc', None)
+            
+            # Track maximum num_prbc and validate
+            if num_prbc is not None:
+                # Check if this packet exceeds the current maximum before updating
+                if analysis_data.get('max_num_prbc', 0) > 0 and num_prbc > analysis_data['max_num_prbc']:
+                    print(f"ERROR: Packet has {num_prbc} PRBs, which exceeds detected maximum of {analysis_data['max_num_prbc']} PRBs!")
+                    print(f"  Frame: {frame_id}, Subframe: {subframe_id}, Slot: {slot_id}, Symbol: {start_symbol_id}, eAxC ID: {eaxc_id}")
+                # Update maximum
+                if num_prbc > analysis_data.get('max_num_prbc', 0):
+                    analysis_data['max_num_prbc'] = num_prbc
+            
             # Get compression method and width from fields (hardcoded from top variables)
             # Default to BFP if not set
             compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
@@ -883,21 +978,8 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             data_direction = fields.get('data_direction', 1)
             direction = 'DL' if data_direction == 1 else 'UL'
             
-            # Get num_prbc from fields (dynamically determined from ORAN section tree)
-            num_prbc = fields.get('num_prbc', None)
-            
-            # Track maximum num_prbc and validate
-            if num_prbc is not None:
-                # Check if this packet exceeds the current maximum before updating
-                if max_num_prbc > 0 and num_prbc > max_num_prbc:
-                    print(f"ERROR: Packet has {num_prbc} PRBs, which exceeds detected maximum of {max_num_prbc} PRBs!")
-                    print(f"  Frame: {frame_id}, Subframe: {subframe_id}, Slot: {slot_id}, Symbol: {start_symbol_id}, eAxC ID: {eaxc_id}")
-                # Update maximum
-                if num_prbc > max_num_prbc:
-                    max_num_prbc = num_prbc
-            
             # Use max_num_prbc for parsing limits, default to calculated if not available
-            current_max_rbs = max_num_prbc if max_num_prbc > 0 else (num_prbc if num_prbc is not None else 106)
+            current_max_rbs = analysis_data.get('max_num_prbc', 0) if analysis_data.get('max_num_prbc', 0) > 0 else (num_prbc if num_prbc is not None else 106)
             
             # Extract IQ samples from prb_raw if available
             if prb_raw is not None:
@@ -919,15 +1001,24 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
             # Store samples by eAxC ID (RU Port ID) and direction
             iq_data[eaxc_id][direction].extend(samples)
             
+            # Track compression type
+            analysis_data['compression_types'].add(compression_type)
+            
             # Track maximum uncompressed I/Q values for this eAxC ID
             if len(samples) > 0:
                 max_i, max_q, max_abs = calculate_max_iq(samples)
                 
-                # Update maximums for this eAxC ID
+                # Update maximums for this eAxC ID (both in iq_data tracking and analysis_data)
                 if max_abs > max_iq_values[eaxc_id]['max_abs']:
                     max_iq_values[eaxc_id]['max_i'] = max_i
                     max_iq_values[eaxc_id]['max_q'] = max_q
                     max_iq_values[eaxc_id]['max_abs'] = max_abs
+                
+                # Also update analysis_data max_iq_values
+                if max_abs > analysis_data['max_iq_values'][eaxc_id]['max_abs']:
+                    analysis_data['max_iq_values'][eaxc_id]['max_i'] = max_i
+                    analysis_data['max_iq_values'][eaxc_id]['max_q'] = max_q
+                    analysis_data['max_iq_values'][eaxc_id]['max_abs'] = max_abs
             
             # Use the exponents list directly if BFP (already one per RB)
             rb_exponents = None
@@ -960,55 +1051,221 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None):
                 metadata_entry['rb_exponents'] = rb_exponents
             
             iq_data[eaxc_id]['metadata'].append(metadata_entry)
-            packet_count += 1
+            
+            # Update analysis statistics (same as analyze_pcap)
+            analysis_data['eaxc_ids'].add(eaxc_id)
+            analysis_data['directions'].add(direction)
+            analysis_data['frames'].add(frame_id)
+            analysis_data['subframes'].add(subframe_id)
+            analysis_data['slots'].add(slot_id)
+            analysis_data['symbols'].add(start_symbol_id)
+            analysis_data['total_samples'] += num_samples
+            analysis_data['eaxc_stats'][eaxc_id][direction]['packets'] += 1
+            analysis_data['eaxc_stats'][eaxc_id][direction]['samples'] += num_samples
+            
+            # Track symbol counts: use overall_symbol when filtering is active, otherwise use start_symbol_id
+            if start_symbol is not None or end_symbol is not None:
+                # When filtering by overall symbol, track overall symbols
+                analysis_data['overall_symbol_counts'][overall_symbol] += 1
+                # Track samples for this overall symbol
+                analysis_data['overall_symbol_samples'][overall_symbol] += num_samples
+                # Track unique (frame, subframe, slot, symbol, eaxc) combinations per overall symbol
+                combo = (frame_id, subframe_id, slot_id, start_symbol_id, eaxc_id)
+                analysis_data['overall_symbol_unique_combos'][overall_symbol].add(combo)
+                # Track packets per overall symbol per eAxC ID
+                analysis_data['overall_symbol_eaxc_counts'][overall_symbol][eaxc_id] += 1
+            else:
+                # When not filtering, track symbol_ids within slots
+                analysis_data['symbol_counts'][start_symbol_id] += 1
+            
+            analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['packets'] += 1
+            analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['samples'] += num_samples
+            analysis_data['slot_symbol_eaxc_data'][slot_id][start_symbol_id][eaxc_id] += 1
+            frame_slot_data = analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][start_symbol_id][eaxc_id]
+            frame_slot_data['packets'] += 1
+            frame_slot_data['samples'] += num_samples
+            # Store start_prbc and num_prbc (use first non-None value or update if different)
+            if frame_slot_data['start_prbc'] is None:
+                frame_slot_data['start_prbc'] = start_prbc
+            if frame_slot_data['num_prbc'] is None:
+                frame_slot_data['num_prbc'] = num_prbc
+            
+            # Track which RBs have non-zero IQ data (12 samples per RB)
+            if len(samples) > 0:
+                samples_per_rb = 12
+                num_rbs_in_samples = len(samples) // samples_per_rb
+                
+                # Check each RB to see if it has any non-zero samples
+                for rb_idx in range(num_rbs_in_samples):
+                    rb_start = rb_idx * samples_per_rb
+                    rb_end = rb_start + samples_per_rb
+                    rb_samples = samples[rb_start:rb_end]
+                    
+                    # Check if any sample in this RB is non-zero
+                    has_nonzero = any(abs(s) > 1e-10 for s in rb_samples)  # Use small epsilon for float comparison
+                    
+                    if has_nonzero:
+                        # Store the actual RB index (start_prbc + rb_idx)
+                        actual_rb_index = start_prbc + rb_idx
+                        frame_slot_data['rbs_with_data'].add(actual_rb_index)
             
         except Exception as e:
             # Skip packets that cause errors
             continue
     
     cap.close()
-    print(f"Processed {packet_count} IQ data packets\n")
+    print(f"Found {total_packets} total packets\n")
     
-    # Print detected maximum PRBs
-    if max_num_prbc > 0:
-        print(f"Detected maximum PRBs: {max_num_prbc}\n")
+    # Return both IQ data and analysis data
+    return iq_data, analysis_data, total_packets
+
+def print_analysis_report(analysis_data, total_packets, start_symbol=None, end_symbol=None):
+    """Print the analysis report using the collected analysis data"""
+    # Calculate duration
+    duration_sec = 0
+    if len(analysis_data['packet_timestamps']) > 1:
+        duration_sec = max(analysis_data['packet_timestamps']) - min(analysis_data['packet_timestamps'])
     
-    # Print summary by eAxC ID
-    print("=" * 110)
-    print(f"{'eAxC ID':<10} {'Direction':<12} {'Samples':<15} {'Packets':<10} {'Max I/Q':<15} {'Est. IQ Backoff':<18}")
-    print("=" * 110)
-    
-    total_ul = 0
-    total_dl = 0
-    
-    for eaxc_id in sorted(iq_data.keys()):
-        ul_samples = len(iq_data[eaxc_id]['UL'])
-        dl_samples = len(iq_data[eaxc_id]['DL'])
-        max_iq = max_iq_values[eaxc_id]['max_abs']
-        
-        if ul_samples > 0:
-            ul_packets = sum(1 for m in iq_data[eaxc_id]['metadata'] if m['direction'] == 'UL')
-            max_iq_str = f"{max_iq:.0f}" if max_iq > 0 else "N/A"
-            dbfs = calculate_dbfs(max_iq)
-            dbfs_str = f"{dbfs:.1f} dBFS" if dbfs is not None else "N/A"
-            print(f"{eaxc_id:<10} {'UL':<12} {ul_samples:<15,} {ul_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
-            total_ul += ul_samples
-        
-        if dl_samples > 0:
-            dl_packets = sum(1 for m in iq_data[eaxc_id]['metadata'] if m['direction'] == 'DL')
-            max_iq_str = f"{max_iq:.0f}" if max_iq > 0 else "N/A"
-            dbfs = calculate_dbfs(max_iq)
-            dbfs_str = f"{dbfs:.1f} dBFS" if dbfs is not None else "N/A"
-            print(f"{eaxc_id:<10} {'DL':<12} {dl_samples:<15,} {dl_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
-            total_dl += dl_samples
-    
-    print("=" * 110)
-    print(f"{'TOTAL':<10} {'UL':<12} {total_ul:<15,}")
-    print(f"{'TOTAL':<10} {'DL':<12} {total_dl:<15,}")
-    print("=" * 110)
+    # Print analysis report
+    print("=" * 80)
+    print("PCAP FILE ANALYSIS REPORT")
+    print("=" * 80)
     print()
     
-    return iq_data
+    print("OVERVIEW:")
+    print(f"  Total Packets:        {total_packets:,}")
+    
+    # When filtering by overall symbol, show only packets that match the filtered symbols
+    if start_symbol is not None or end_symbol is not None:
+        # Use the sum of overall_symbol_counts as the accurate count of filtered packets
+        filtered_packet_count = sum(analysis_data['overall_symbol_counts'].values())
+        filtered_samples_count = sum(analysis_data['overall_symbol_samples'].values())
+        print(f"  IQ Data Packets:      {filtered_packet_count:,}")
+        print(f"  Total IQ Samples:      {filtered_samples_count:,}")
+    else:
+        print(f"  IQ Data Packets:      {analysis_data['packet_count']:,}")
+        print(f"  Total IQ Samples:      {analysis_data['total_samples']:,}")
+    if analysis_data['compression_types']:
+        comp_types = ', '.join(sorted(analysis_data['compression_types']))
+        print(f"  Compression Types:    {comp_types}")
+    if duration_sec > 0:
+        print(f"  Duration:             {duration_sec:.3f} seconds ({duration_sec*1000:.1f} ms)")
+        if analysis_data['packet_count'] > 0:
+            print(f"  Average Packet Rate:  {analysis_data['packet_count']/duration_sec:.1f} packets/sec")
+    print()
+    
+    print("eAxC IDs:")
+    if analysis_data['eaxc_ids']:
+        eaxc_list = sorted(analysis_data['eaxc_ids'])
+        print(f"  Found: {len(eaxc_list)} eAxC ID(s): {', '.join(map(str, eaxc_list))}")
+        print()
+        print("=" * 110)
+        print(f"{'eAxC ID':<10} {'Direction':<12} {'Samples':<15} {'Packets':<10} {'Max I/Q':<15} {'Est. IQ Backoff':<18}")
+        print("=" * 110)
+        for eaxc_id in eaxc_list:
+            max_iq = analysis_data['max_iq_values'][eaxc_id]['max_abs']
+            max_iq_str = f"{max_iq:.2f}" if max_iq > 0 else "N/A"
+            dbfs = calculate_dbfs(max_iq)
+            dbfs_str = f"{dbfs:.2f} dBFS" if dbfs is not None else "N/A"
+            for direction in ['UL', 'DL']:
+                stats = analysis_data['eaxc_stats'][eaxc_id][direction]
+                # When filtering, use stats only from filtered packets
+                if start_symbol is not None or end_symbol is not None:
+                    # Calculate filtered stats for this eAxC ID and direction
+                    filtered_packets = 0
+                    for overall_sym in analysis_data['overall_symbol_eaxc_counts']:
+                        if eaxc_id in analysis_data['overall_symbol_eaxc_counts'][overall_sym]:
+                            filtered_packets += analysis_data['overall_symbol_eaxc_counts'][overall_sym][eaxc_id]
+                    # Estimate samples based on average samples per packet for this eAxC/direction
+                    if filtered_packets > 0:
+                        if stats['packets'] > 0:
+                            avg_samples_per_packet = stats['samples'] / stats['packets']
+                            filtered_samples = int(filtered_packets * avg_samples_per_packet)
+                        else:
+                            filtered_samples = 0
+                        print(f"{eaxc_id:<10} {direction:<12} {filtered_samples:<15,} {filtered_packets:<10} {max_iq_str:<15} {dbfs_str:<18}")
+                elif stats['packets'] > 0:
+                    print(f"{eaxc_id:<10} {direction:<12} {stats['samples']:<15,} {stats['packets']:<10} {max_iq_str:<15} {dbfs_str:<18}")
+        print("=" * 110)
+        print()
+    else:
+        print("  No eAxC IDs found")
+        print()
+    
+    print("DIRECTIONS:")
+    if analysis_data['directions']:
+        dir_list = sorted(analysis_data['directions'])
+        print(f"  Found: {', '.join(dir_list)}")
+    else:
+        print("  No direction data found")
+    print()
+    
+    print("FRAME INFORMATION:")
+    if analysis_data['frames']:
+        frame_list = sorted(analysis_data['frames'])
+        print(f"  Frame IDs: {min(frame_list)} to {max(frame_list)} ({len(frame_list)} unique frames)")
+        print(f"  Subframe IDs: {sorted(analysis_data['subframes'])}")
+    else:
+        print("  No frame data found")
+    print()
+    
+    print("SLOT INFORMATION:")
+    if analysis_data['slots']:
+        slot_list = sorted(analysis_data['slots'])
+        print(f"  Slot IDs: {min(slot_list)} to {max(slot_list)} ({len(slot_list)} unique slots)")
+    else:
+        print("  No slot data found")
+    print()
+    
+    print("SYMBOL INFORMATION:")
+    if start_symbol is not None or end_symbol is not None:
+        # When filtering by overall symbol, show overall symbols
+        if analysis_data['overall_symbol_counts']:
+            overall_symbol_list = sorted(analysis_data['overall_symbol_counts'].keys())
+            print(f"  Overall Symbol Numbers: {min(overall_symbol_list)} to {max(overall_symbol_list)} ({len(overall_symbol_list)} unique overall symbols)")
+            print(f"  Packets per overall symbol:")
+            for overall_sym in overall_symbol_list:
+                total_count = analysis_data['overall_symbol_counts'][overall_sym]
+                unique_combos = len(analysis_data['overall_symbol_unique_combos'][overall_sym])
+                eaxc_breakdown = analysis_data['overall_symbol_eaxc_counts'][overall_sym]
+                
+                print(f"    Overall Symbol {overall_sym:2d}: {total_count:4d} packets ({unique_combos} unique frame/subframe/slot/symbol/eAxC combos)")
+                
+                # Show the actual unique combinations to understand why there are multiple
+                if unique_combos > 1 and unique_combos <= 20:  # Only show if reasonable number
+                    print(f"      Unique combos for overall symbol {overall_sym}:")
+                    for combo in sorted(analysis_data['overall_symbol_unique_combos'][overall_sym]):
+                        frame_id, subframe_id, slot_id, symbol_id, eaxc_id = combo
+                        print(f"        Frame {frame_id}, Subframe {subframe_id}, Slot {slot_id}, Symbol {symbol_id}, eAxC {eaxc_id}")
+                
+                if len(eaxc_breakdown) > 1:
+                    # Show breakdown by eAxC ID if multiple eAxC IDs
+                    for eaxc_id in sorted(eaxc_breakdown.keys()):
+                        eaxc_count = eaxc_breakdown[eaxc_id]
+                        print(f"      eAxC ID {eaxc_id}: {eaxc_count:4d} packets")
+        else:
+            print("  No overall symbol data found")
+    else:
+        # When not filtering, show symbol_ids within slots
+        if analysis_data['symbols']:
+            symbol_list = sorted(analysis_data['symbols'])
+            print(f"  Symbol IDs: {min(symbol_list)} to {max(symbol_list)} ({len(symbol_list)} unique symbols)")
+            print(f"  Symbol range: {symbol_list}")
+            if analysis_data['symbol_counts']:
+                print(f"  Packets per symbol:")
+                for sym_id in symbol_list:
+                    count = analysis_data['symbol_counts'][sym_id]
+                    print(f"    Symbol {sym_id:2d}: {count:4d} packets")
+        else:
+            print("  No symbol data found")
+    print()
+    
+    print("=" * 80)
+    print()
+    
+    # Print detected maximum PRBs
+    if analysis_data.get('max_num_prbc', 0) > 0:
+        print(f"Detected maximum PRBs: {analysis_data['max_num_prbc']}\n")
 
 def save_separated_data(iq_data, output_base):
     """Save IQ data separated by eAxC ID and direction"""
@@ -2030,8 +2287,6 @@ if __name__ == "__main__":
                        help='Start overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
     parser.add_argument('--end-symbol', type=int, metavar='N',
                        help='End overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
-    parser.add_argument('--analyze', action='store_true',
-                       help='Analyze PCAP file only')
     parser.add_argument('--force-bfp', action='store_true',
                        help='Force BFP decompression')
     parser.add_argument('--bfp-exponent', type=int, metavar='N',
@@ -2066,27 +2321,25 @@ if __name__ == "__main__":
             print(f"Error: Start symbol must be >= 0")
             sys.exit(1)
     
-    # If --analyze is specified, just analyze and exit
-    if args.analyze:
-        # When --symbols is used, restrict to first frame/subframe/slot
-        # When --start-symbol/--end-symbol is used directly, allow any frame/subframe/slot
-        restrict_to_first = (args.symbols is not None and args.symbols > 0)
-        analyze_pcap(args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent, 
-                     start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first)
-        
-        # Calculate and print execution time
-        end_time = time.time()
-        execution_time = end_time - start_time
-        print(f"\nExecution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
-        
-        sys.exit(0)
+    # When --symbols is used, restrict to first frame/subframe/slot
+    # When --start-symbol/--end-symbol is used directly, allow any frame/subframe/slot
+    restrict_to_first = (args.symbols is not None and args.symbols > 0)
     
-    # Extract IQ samples with metadata
-    iq_data = extract_iq_with_metadata(args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent)
+    # Extract IQ samples with metadata (also collects analysis data in a single pass)
+    iq_data, analysis_data, total_packets = extract_iq_with_metadata(
+        args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent,
+        start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first)
     
     if len(iq_data) == 0:
         print("No IQ data found!")
         sys.exit(1)
+    
+    # Print analysis report (uses data collected during extraction)
+    print_analysis_report(analysis_data, total_packets, start_symbol=start_symbol, end_symbol=end_symbol)
+    
+    # Create resource allocation plot
+    if analysis_data['packet_count'] > 0:
+        plot_resource_allocation(analysis_data, args.pcap_file)
     
     # Create Plots directory in workspace root
     workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
