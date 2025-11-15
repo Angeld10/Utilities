@@ -1364,25 +1364,12 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
                 cap = pyshark.FileCapture(pcap_file, use_json=True)
             except:
                 cap = pyshark.FileCapture(pcap_file)
-        
-        total_packets = 0
-        for _ in cap:
-            total_packets += 1
-        cap.close()
-        
-        # Reopen for processing
-        try:
-            cap = pyshark.FileCapture(pcap_file, use_json=True, include_raw=True)
-        except:
-            try:
-                cap = pyshark.FileCapture(pcap_file, use_json=True)
-            except:
-                cap = pyshark.FileCapture(pcap_file)
     except Exception as e:
         print(f"Error opening pcap file: {e}")
         return {}
     
-    print(f"Found {total_packets} total packets\n")
+    # We'll count packets as we process them (removed duplicate pass to improve performance)
+    total_packets = 0
     
     # Helper function to create a new dict with a new set for rbs_with_data
     def make_frame_slot_data():
@@ -1415,6 +1402,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     }
     
     for packet in cap:
+        total_packets += 1  # Count packets as we process them (single pass)
         try:
             # Skip non-ORAN FH packets early
             # Check if packet has ORAN_FH_CUS layer
@@ -1820,13 +1808,17 @@ def plot_resource_allocation(analysis_data, pcap_file):
     # Create a separate plot for each eAxC ID
     for eaxc_id in eaxc_list:
         # Collect all unique (frame, subframe, slot, symbol) combinations for this eAxC ID
-        unique_combinations = []
-        combination_data = {}  # (frame, subframe, slot, symbol) -> {'samples': X, 'rbs': Y}
+        # First, collect slots that have data for this eAxC ID
+        slots_with_data = set()  # (frame, subframe, slot) combinations that have data
+        combination_data = {}  # (frame, subframe, slot, symbol) -> {'samples': X, 'rbs': Y, 'start_prbc': Z, 'rbs_with_data': set()}
         
         # Iterate directly over existing combinations in the data structure (only filtered data is present)
         for frame_id in analysis_data['frame_subframe_slot_symbol_eaxc_data']:
             for subframe_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id]:
                 for slot_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id]:
+                    slot_key = (frame_id, subframe_id, slot_id)
+                    has_data_for_slot = False
+                    
                     for symbol_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id]:
                         # Only process combinations for this eAxC ID
                         if eaxc_id in analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][symbol_id]:
@@ -1836,7 +1828,7 @@ def plot_resource_allocation(analysis_data, pcap_file):
                             
                             if total_samples > 0:
                                 combo = (frame_id, subframe_id, slot_id, symbol_id)
-                                unique_combinations.append(combo)
+                                has_data_for_slot = True
                                 
                                 # Use start_prbc and num_prbc from ORAN section tree if available
                                 start_prbc_val = symbol_data.get('start_prbc', 0) if symbol_data.get('start_prbc') is not None else 0
@@ -1861,6 +1853,25 @@ def plot_resource_allocation(analysis_data, pcap_file):
                                 # Get RBs with data for this combination
                                 rbs_with_data = symbol_data.get('rbs_with_data', set())
                                 combination_data[combo] = {'samples': total_samples, 'rbs': num_rbs, 'packets': packet_count, 'start_prbc': start_prbc_val, 'rbs_with_data': rbs_with_data}
+                    
+                    # If this slot has any data, mark it for inclusion
+                    if has_data_for_slot:
+                        slots_with_data.add(slot_key)
+        
+        # Now create unique_combinations that includes ALL 14 symbols (0-13) for each slot that has data
+        # Missing symbols will show as unallocated (gray) in the plot
+        unique_combinations = []
+        SYMBOLS_PER_SLOT_PLOT = 14  # 5G NR has 14 symbols per slot (normal cyclic prefix)
+        
+        for slot_key in sorted(slots_with_data):
+            frame_id, subframe_id, slot_id = slot_key
+            # Include all 14 symbols (0-13) for this slot, even if they don't have data
+            for symbol_id in range(SYMBOLS_PER_SLOT_PLOT):
+                combo = (frame_id, subframe_id, slot_id, symbol_id)
+                unique_combinations.append(combo)
+                # If this combo doesn't have data, create an empty entry (will show as unallocated)
+                if combo not in combination_data:
+                    combination_data[combo] = {'samples': 0, 'rbs': 0, 'packets': 0, 'start_prbc': 0, 'rbs_with_data': set()}
         
         if len(unique_combinations) == 0:
             continue  # Skip this eAxC ID if no data
@@ -2002,6 +2013,9 @@ def plot_resource_allocation(analysis_data, pcap_file):
 if __name__ == "__main__":
     import argparse
     
+    # Record start time
+    start_time = time.time()
+    
     parser = argparse.ArgumentParser(
         description='Extract IQ samples from 5G NR Fronthaul PCAP files (Wireshark-based)'
     )
@@ -2059,6 +2073,12 @@ if __name__ == "__main__":
         restrict_to_first = (args.symbols is not None and args.symbols > 0)
         analyze_pcap(args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent, 
                      start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first)
+        
+        # Calculate and print execution time
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"\nExecution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
+        
         sys.exit(0)
     
     # Extract IQ samples with metadata
@@ -2135,4 +2155,9 @@ if __name__ == "__main__":
                   start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir)
     
     print("Done!")
+    
+    # Calculate and print execution time
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"\nExecution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
 
