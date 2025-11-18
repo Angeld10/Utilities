@@ -10,7 +10,9 @@ import math
 import re
 import json
 import numpy as np
+import subprocess
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 try:
     import pyshark
 except ImportError:
@@ -20,8 +22,8 @@ except ImportError:
 # Import helper functions from the original script
 # We'll copy the helper functions that don't depend on scapy
 
-FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
-FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
+FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed'
+FORCE_BFP_BITWIDTH = 16                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
@@ -788,6 +790,186 @@ def get_oran_fh_cus_fields_from_packet(packet):
         print(f"Exception in get_oran_fh_cus_fields_from_packet: {e}")
         return None
 
+def _process_packet_batch(args):
+    """Worker function to process a batch of packets in parallel
+    
+    Args:
+        args: tuple of (packet_data_list, force_bfp, bfp_exponent, FORCE_COMPRESSION_TYPE, FORCE_BFP_BITWIDTH, ENDIAN)
+            where packet_data_list is a list of dicts containing:
+                - fields: dict of extracted fields
+                - prb_raw: raw PRB data (list) or None
+                - oran_data: raw ORAN data bytes or None
+                - max_rbs: maximum RBs to parse
+    
+    Returns:
+        dict: Results containing samples, metadata, statistics for this batch
+    """
+    packet_data_list, force_bfp, bfp_exponent, FORCE_COMPRESSION_TYPE, FORCE_BFP_BITWIDTH, ENDIAN = args
+    import numpy as np
+    from collections import defaultdict
+    
+    # Import functions needed by worker
+    # When using multiprocessing, functions need to be importable
+    # Try multiple strategies to get the functions
+    import sys
+    import importlib
+    
+    parse_iq_from_prb_raw_func = None
+    parse_iq_samples_func = None
+    calculate_max_iq_func = None
+    
+    # Strategy 1: Try importing from PCAP_Analyzer_WS module
+    try:
+        module = importlib.import_module('PCAP_Analyzer_WS')
+        parse_iq_from_prb_raw_func = getattr(module, 'parse_iq_from_prb_raw', None)
+        parse_iq_samples_func = getattr(module, 'parse_iq_samples', None)
+        calculate_max_iq_func = getattr(module, 'calculate_max_iq', None)
+    except ImportError:
+        pass
+    
+    # Strategy 2: Try getting from __main__ (when run as script)
+    if not parse_iq_from_prb_raw_func:
+        main_module = sys.modules.get('__main__')
+        if main_module and hasattr(main_module, 'parse_iq_from_prb_raw'):
+            parse_iq_from_prb_raw_func = main_module.parse_iq_from_prb_raw
+            parse_iq_samples_func = main_module.parse_iq_samples
+            calculate_max_iq_func = main_module.calculate_max_iq
+    
+    # Strategy 3: Try getting from current module
+    if not parse_iq_from_prb_raw_func:
+        current_module = sys.modules.get(__name__)
+        if current_module:
+            parse_iq_from_prb_raw_func = getattr(current_module, 'parse_iq_from_prb_raw', None)
+            parse_iq_samples_func = getattr(current_module, 'parse_iq_samples', None)
+            calculate_max_iq_func = getattr(current_module, 'calculate_max_iq', None)
+    
+    # If still no functions, cannot proceed
+    if not parse_iq_from_prb_raw_func or not parse_iq_samples_func or not calculate_max_iq_func:
+        return {'packet_results': [], 'compression_types': [], 'max_iq_values': {}}
+    
+    batch_results = {
+        'packet_results': [],
+        'compression_types': set(),
+        'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0})
+    }
+    
+    for packet_data in packet_data_list:
+        try:
+            fields = packet_data['fields']
+            prb_raw = packet_data.get('prb_raw')
+            oran_data = packet_data.get('oran_data')
+            current_max_rbs = packet_data.get('max_rbs', 106)
+            
+            # Get compression method and width
+            compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
+            compression_width = fields.get('compression_width', FORCE_BFP_BITWIDTH)
+            
+            # Parse IQ samples
+            samples = []
+            compression_type = "uncompressed"
+            num_samples = 0
+            exponents_list = None
+            
+            if prb_raw is not None and parse_iq_from_prb_raw_func:
+                samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw_func(
+                    prb_raw, compression_method, compression_width, max_rbs=current_max_rbs)
+            elif oran_data is not None and parse_iq_samples_func:
+                iq_offset = 8
+                samples, compression_type, num_samples, exponents_list = parse_iq_samples_func(
+                    oran_data, iq_offset, 0, 0,
+                    force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
+            else:
+                continue  # Skip if no data
+            
+            if len(samples) == 0:
+                continue
+            
+            # Calculate max IQ values
+            if calculate_max_iq_func:
+                max_i, max_q, max_abs = calculate_max_iq_func(samples)
+            else:
+                # Fallback: simple calculation
+                if samples:
+                    samples_array = np.array(samples, dtype=complex)
+                    max_i = float(np.max(np.abs(samples_array.real)))
+                    max_q = float(np.max(np.abs(samples_array.imag)))
+                    max_abs = max(max_i, max_q)
+                else:
+                    max_i, max_q, max_abs = 0.0, 0.0, 0.0
+            
+            # Get packet metadata from fields
+            eaxc_id = fields.get('ru_port_id', 0)
+            direction = 'DL' if fields.get('data_direction', 1) == 1 else 'UL'
+            frame_id = fields.get('frame_id', 0)
+            subframe_id = fields.get('subframe_id', 0)
+            slot_id = fields.get('slot_id', 0)
+            start_symbol_id = fields.get('start_symbol_id', 0)
+            start_prbc = fields.get('start_prbc', 0)
+            
+            # Calculate RB non-zero detection
+            rbs_with_data = set()
+            samples_per_rb = 12
+            num_rbs_in_samples = len(samples) // samples_per_rb
+            if num_rbs_in_samples > 0:
+                samples_array = np.array(samples[:num_rbs_in_samples * samples_per_rb], dtype=complex)
+                rb_samples_2d = samples_array.reshape(num_rbs_in_samples, samples_per_rb)
+                magnitudes = np.abs(rb_samples_2d)
+                has_nonzero_per_rb = np.any(magnitudes > 1e-10, axis=1)
+                for rb_idx in np.where(has_nonzero_per_rb)[0]:
+                    actual_rb_index = start_prbc + rb_idx
+                    rbs_with_data.add(actual_rb_index)
+            
+            # Get additional fields for analysis
+            section_id = int(fields.get('sectionId', 0)) if 'sectionId' in fields else 0
+            ru_port_id = fields.get('ru_port_id', 0) if 'ru_port_id' in fields else 0
+            num_prbc = fields.get('num_prbc', None)
+            sym_inc = fields.get('sym_inc', 0)
+            num_symbols = sym_inc + 1 if sym_inc > 0 else 1
+            
+            # Prepare results for this packet
+            packet_result = {
+                'fields': fields,
+                'samples': samples,
+                'compression_type': compression_type,
+                'num_samples': num_samples,
+                'exponents_list': exponents_list,
+                'max_i': max_i,
+                'max_q': max_q,
+                'max_abs': max_abs,
+                'eaxc_id': eaxc_id,
+                'direction': direction,
+                'frame_id': frame_id,
+                'subframe_id': subframe_id,
+                'slot_id': slot_id,
+                'start_symbol_id': start_symbol_id,
+                'start_prbc': start_prbc,
+                'rbs_with_data': list(rbs_with_data),  # Convert set to list for pickling
+                'section_id': section_id,
+                'ru_port_id': ru_port_id,
+                'num_prbc': num_prbc,
+                'num_symbols': num_symbols,
+                'sym_inc': sym_inc
+            }
+            
+            batch_results['packet_results'].append(packet_result)
+            batch_results['compression_types'].add(compression_type)
+            
+            # Update max IQ values
+            if max_abs > batch_results['max_iq_values'][eaxc_id]['max_abs']:
+                batch_results['max_iq_values'][eaxc_id]['max_i'] = max_i
+                batch_results['max_iq_values'][eaxc_id]['max_q'] = max_q
+                batch_results['max_iq_values'][eaxc_id]['max_abs'] = max_abs
+                
+        except Exception as e:
+            # Skip packets that cause errors
+            continue
+    
+    # Convert sets to lists for pickling
+    batch_results['compression_types'] = list(batch_results['compression_types'])
+    batch_results['max_iq_values'] = dict(batch_results['max_iq_values'])
+    
+    return batch_results
+
 def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False):
     """Extract IQ samples with direction and eAxC ID information using pyshark.
     Also collects analysis statistics for reporting.
@@ -810,19 +992,138 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
     first_frame_subframe_slot = None
     
     try:
+        current_prefs = {}
+        try:
+            result = subprocess.run(
+                ['tshark', '-G', 'defaultprefs'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            for pref_name in pref_names:
+                for line in result.stdout.split('\n'):
+                    if line.strip().startswith('#' + pref_name + ':'):
+                        value = line.split(':', 1)[1].strip() if ':' in line else 'Unknown'
+                        current_prefs[pref_name] = value
+                        print(f"  {pref_name}: {value}")
+                        break
+        except Exception as e:
+            print(f"  Warning: Could not read current preferences: {e}")
+        
+        print("-" * 60)
+        
+        # Set ORAN FH CUS protocol preferences based on compression type
+        # This ensures Wireshark/TShark dissects packets correctly
+        # Use override_prefs (dictionary) instead of custom_parameters (command-line flags)
+        # for a cleaner Python API
+        
+        # Set compression method preference for ORAN FH CUS
+        # Use string values as specified in TShark preferences (case-insensitive)
+        # Valid values: "COMP_NONE", "COMP_BLOCK_FP", "No Compression", "Block Floating Point Compression", etc.
+        if FORCE_COMPRESSION_TYPE.upper() == 'BFP':
+            compression_pref = 'COMP_BLOCK_FP'  # or 'Block Floating Point Compression'
+            iq_bitwidth = str(FORCE_BFP_BITWIDTH)
+        else:
+            compression_pref = 'COMP_NONE'  # or 'No Compression'
+            iq_bitwidth = '16'
+        
+        # Create dictionary of ORAN FH CUS preferences for both uplink and downlink
+        # override_prefs expects string values
+        override_prefs = {
+            'oran_fh_cus.oran.ud_comp_up': compression_pref,
+            'oran_fh_cus.oran.iq_bitwidth_up': iq_bitwidth,
+            'oran_fh_cus.oran.ud_comp_down': compression_pref,
+            'oran_fh_cus.oran.iq_bitwidth_down': iq_bitwidth,
+        }
+        
+        print(f"\nSetting ORAN FH CUS protocol preferences (based on FORCE_COMPRESSION_TYPE='{FORCE_COMPRESSION_TYPE}'):")
+        print("-" * 60)
+        for pref_name, pref_value in override_prefs.items():
+            if "ud_comp" in pref_name:
+                if pref_value == "COMP_BLOCK_FP" or pref_value == "Block Floating Point Compression":
+                    comp_desc = "Block Floating Point Compression"
+                elif pref_value == "COMP_NONE" or pref_value == "No Compression":
+                    comp_desc = "No Compression"
+                else:
+                    comp_desc = pref_value
+                print(f"  {pref_name}: {comp_desc} ({pref_value})")
+            else:
+                print(f"  {pref_name}: {pref_value}")
+        print("-" * 60)
+        print()
+        
+        # Set decode_as to decode UDP packets as ORAN FH CUS
+        # This ensures packets are properly dissected even if not auto-detected
+        # Note: decode_as format requires port-specific syntax: {'udp.port==PORT': 'oran_fh_cus'}
+        # Since we don't know the specific port, we'll try to decode common ORAN ports
+        # ORAN FH CUS typically uses ephemeral ports, so we'll skip decode_as for now
+        # and rely on Wireshark's auto-detection, or set it conditionally if needed
+        decode_as = None  # Disable decode_as to avoid TShark crashes - let Wireshark auto-detect
+        # If you know the specific UDP port, uncomment and set it:
+        # decode_as = {'udp.port==1234': 'oran_fh_cus'}  # Replace 1234 with actual port
+        print("decode_as: Using Wireshark auto-detection for ORAN FH CUS protocol")
+        print("  (If packets aren't detected, specify decode_as with known UDP port)")
+        print()
+        
+        # IMPORTANT: Use custom_parameters with -o flags to ensure preferences are actually applied
+        # override_prefs may not always work correctly, so we'll use both methods
+        # Build custom_parameters list with -o flags for preferences (more reliable)
+        custom_params = []
+        for pref_name, pref_value in override_prefs.items():
+            custom_params.extend(['-o', f'{pref_name}:{pref_value}'])
+        
+        print("Also setting preferences via custom_parameters (-o flags) for reliability:")
+        print("-" * 60)
+        for i in range(0, len(custom_params), 2):
+            if i+1 < len(custom_params):
+                print(f"  {custom_params[i]} {custom_params[i+1]}")
+        print("-" * 60)
+        print()
+        
         # Open pcap file with pyshark
         # Try without display filter first, then filter in Python
         # Display filters can cause issues with some TShark versions
         try:
             # Optimization: Use keep_packets=False to avoid storing all packets in memory
             # This significantly speeds up processing for large PCAP files
-            cap = pyshark.FileCapture(pcap_file, use_json=True, include_raw=True, keep_packets=False)
+            # Use BOTH override_prefs AND custom_parameters to ensure preferences are applied
+            print("custom_params: ", custom_params)
+            print("override_prefs: ", override_prefs)
+            print("decode_as: ", decode_as)
+            cap = pyshark.FileCapture(
+                pcap_file, 
+                use_json=True, 
+                include_raw=True, 
+                keep_packets=False,
+                override_prefs=override_prefs,
+                custom_parameters=custom_params if custom_params else None,
+                decode_as=decode_as if decode_as else {}
+            )
         except:
             try:
-                cap = pyshark.FileCapture(pcap_file, use_json=True, keep_packets=False)
+                cap = pyshark.FileCapture(
+                    pcap_file, 
+                    use_json=True, 
+                    keep_packets=False,
+                    override_prefs=override_prefs,
+                    custom_parameters=custom_params if custom_params else None,
+                    decode_as=decode_as if decode_as else {}
+                )
             except:
-                # Fallback to basic capture
-                cap = pyshark.FileCapture(pcap_file, keep_packets=False)
+                # Fallback to basic capture (without preferences if they cause issues)
+                try:
+                    cap = pyshark.FileCapture(
+                        pcap_file, 
+                        keep_packets=False,
+                        override_prefs=override_prefs,
+                        custom_parameters=custom_params if custom_params else None,
+                        decode_as=decode_as if decode_as else {}
+                    )
+                except:
+                    # Last resort: basic capture without preferences
+                    cap = pyshark.FileCapture(pcap_file, keep_packets=False)
+        
     except Exception as e:
         print(f"Error opening pcap file: {e}")
         return {}, {}, 0
@@ -867,6 +1168,12 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
     # Cache the layer name after first successful detection to speed up subsequent packets
     cached_layer_name = None
     
+    # Phase 1: Collect packet data in batches (sequential - fast field extraction)
+    BATCH_SIZE = 50  # Process 50 packets per batch
+    packet_batches = []
+    current_batch = []
+    
+    print("Phase 1: Extracting packet fields and raw data...")
     for packet in cap:
         total_packets += 1  # Count all packets (single pass)
         try:
@@ -998,6 +1305,10 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
             compression_width = fields.get('compression_width', FORCE_BFP_BITWIDTH)
             prb_raw = fields.get('prb_raw', None)
             
+            # Check if prb_raw is empty (empty list) - treat as None
+            if prb_raw is not None and isinstance(prb_raw, list) and len(prb_raw) == 0:
+                prb_raw = None
+            
             # Determine direction from data_direction field (1 = DL, 0 = UL)
             data_direction = fields.get('data_direction', 1)
             direction = 'DL' if data_direction == 1 else 'UL'
@@ -1005,144 +1316,306 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
             # Use max_num_prbc for parsing limits, default to calculated if not available
             current_max_rbs = analysis_data.get('max_num_prbc', 0) if analysis_data.get('max_num_prbc', 0) > 0 else (num_prbc if num_prbc is not None else 106)
             
-            # Extract IQ samples from prb_raw if available
-            if prb_raw is not None:
-                samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw(
-                    prb_raw, compression_method, compression_width, max_rbs=current_max_rbs)
-            else:
-                # Fallback: try to get raw ORAN FH data
-                oran_data = extract_oran_fh_data_from_packet(packet)
-                if oran_data is None or len(oran_data) < 8:
+            # Collect packet data for batch processing instead of processing immediately
+            # Get raw ORAN data if prb_raw is not available or empty
+            oran_data_bytes = None
+            if prb_raw is None or (isinstance(prb_raw, list) and len(prb_raw) == 0):
+                # First try the ORAN layer extraction
+                oran_data_bytes = extract_oran_fh_data_from_packet(packet)
+                
+                # If extraction from ORAN layer failed, try getting from UDP layer as fallback
+                if oran_data_bytes is None or len(oran_data_bytes) < 8:
+                    try:
+                        # Try to get raw data from UDP layer
+                        if 'udp' in packet:
+                            udp_layer = packet.udp
+                            # Try payload field
+                            if hasattr(udp_layer, 'payload'):
+                                try:
+                                    payload_hex = str(udp_layer.payload)
+                                    if payload_hex:
+                                        oran_data_bytes = bytes.fromhex(payload_hex.replace(':', '').replace(' ', ''))
+                                except (ValueError, AttributeError):
+                                    pass
+                            
+                            # Try data field if payload didn't work
+                            if (oran_data_bytes is None or len(oran_data_bytes) < 8) and hasattr(udp_layer, 'data'):
+                                try:
+                                    data_hex = str(udp_layer.data)
+                                    if data_hex:
+                                        oran_data_bytes = bytes.fromhex(data_hex.replace(':', '').replace(' ', ''))
+                                except (ValueError, AttributeError):
+                                    pass
+                            
+                            # Also try to get from packet's raw data (if FileCapture was opened with include_raw=True)
+                            if (oran_data_bytes is None or len(oran_data_bytes) < 8):
+                                try:
+                                    # In pyshark, raw packet data can be accessed in different ways depending on version
+                                    # Try different methods to get raw packet bytes
+                                    raw_bytes = None
+                                    
+                                    # Method 1: packet.raw attribute (if available)
+                                    if hasattr(packet, 'raw') and packet.raw:
+                                        try:
+                                            raw_bytes = bytes(packet.raw)
+                                        except:
+                                            pass
+                                    
+                                    # Method 2: packet.get_raw_packet() method (if available)
+                                    if raw_bytes is None and hasattr(packet, 'get_raw_packet'):
+                                        try:
+                                            raw_packet = packet.get_raw_packet()
+                                            if raw_packet:
+                                                raw_bytes = bytes(raw_packet) if isinstance(raw_packet, (bytes, bytearray)) else raw_packet
+                                        except:
+                                            pass
+                                    
+                                    # Method 3: Access through frame layer's raw field (if available)
+                                    if raw_bytes is None and 'frame' in packet:
+                                        try:
+                                            frame_layer = packet.frame
+                                            if hasattr(frame_layer, 'raw') and frame_layer.raw:
+                                                raw_hex = str(frame_layer.raw)
+                                                if raw_hex:
+                                                    raw_bytes = bytes.fromhex(raw_hex.replace(':', '').replace(' ', ''))
+                                        except:
+                                            pass
+                                    
+                                    # If we got raw bytes, parse to extract UDP payload
+                                    if raw_bytes and len(raw_bytes) > 42:  # Minimum size for Ethernet + IP + UDP headers
+                                        # Parse Ethernet header (14 bytes)
+                                        # Parse IP header (starts at byte 14, length in low nibble of byte 14)
+                                        ip_header_start = 14
+                                        if len(raw_bytes) > ip_header_start:
+                                            ip_header_len = (raw_bytes[ip_header_start] & 0x0F) * 4  # IP header length
+                                            udp_start = ip_header_start + ip_header_len
+                                            if len(raw_bytes) > udp_start + 8:  # UDP header is 8 bytes
+                                                payload_start = udp_start + 8
+                                                oran_data_bytes = raw_bytes[payload_start:]
+                                except Exception as e:
+                                    # Silently fail - will check oran_data_bytes below
+                                    pass
+                    except Exception as e:
+                        # Silently continue - will check if oran_data_bytes is valid below
+                        pass
+                
+                if oran_data_bytes is None or len(oran_data_bytes) < 8:
                     continue
-                
-                # ORAN FH CUS header is at least 8 bytes, IQ data starts after header
-                iq_offset = 8
-                # Parse IQ samples (handles both uncompressed and BFP compressed)
-                samples, compression_type, num_samples, exponents_list = parse_iq_samples(
-                    oran_data, iq_offset, 0, 0,
-                    force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
             
-            # Store samples by eAxC ID (RU Port ID) and direction
-            # Optimization: Only extend if samples exist (minor optimization)
-            if len(samples) > 0:
-                iq_data[eaxc_id][direction].extend(samples)
-            
-            # Track compression type
-            analysis_data['compression_types'].add(compression_type)
-            
-            # Track maximum uncompressed I/Q values for this eAxC ID
-            if len(samples) > 0:
-                max_i, max_q, max_abs = calculate_max_iq(samples)
-                
-                # Update maximums for this eAxC ID (both in iq_data tracking and analysis_data)
-                if max_abs > max_iq_values[eaxc_id]['max_abs']:
-                    max_iq_values[eaxc_id]['max_i'] = max_i
-                    max_iq_values[eaxc_id]['max_q'] = max_q
-                    max_iq_values[eaxc_id]['max_abs'] = max_abs
-                
-                # Also update analysis_data max_iq_values
-                if max_abs > analysis_data['max_iq_values'][eaxc_id]['max_abs']:
-                    analysis_data['max_iq_values'][eaxc_id]['max_i'] = max_i
-                    analysis_data['max_iq_values'][eaxc_id]['max_q'] = max_q
-                    analysis_data['max_iq_values'][eaxc_id]['max_abs'] = max_abs
-            
-            # Use the exponents list directly if BFP (already one per RB)
-            rb_exponents = None
-            if compression_type.startswith('BFP') and exponents_list is not None:
-                # exponents_list already contains one exponent per RB
-                rb_exponents = [int(exp) for exp in exponents_list]
-            
-            # Store metadata for this packet (ORAN FH CUS format)
-            metadata_entry = {
-                'direction': direction,
-                'eaxc_id': eaxc_id,  # RU Port ID used as eAxC ID
-                'section_id': section_id,  # Keep section_id for reference, but don't use as eAxC ID
-                'ru_port_id': ru_port_id,
-                'frame_id': frame_id,
-                'subframe_id': subframe_id,
-                'slot_id': slot_id,
-                'start_symbol_id': start_symbol_id,
-                'num_symbols': num_symbols,
-                'start_prbc': start_prbc,
-                'num_prbc': num_prbc,  # Number of PRBs for this packet
-                'sym_inc': sym_inc,
-                'num_samples': num_samples,
-                'compression_type': compression_type,
-                'compression_method': compression_method,
-                'compression_width': compression_width
+            # Create packet data entry for batch processing
+            packet_data_entry = {
+                'fields': fields,
+                'prb_raw': prb_raw,
+                'oran_data': oran_data_bytes,
+                'max_rbs': current_max_rbs,
+                'timestamp': None,
+                'analysis_info': {  # Store info needed for analysis tracking
+                    'section_id': section_id,
+                    'ru_port_id': ru_port_id,
+                    'eaxc_id': eaxc_id,
+                    'frame_id': frame_id,
+                    'subframe_id': subframe_id,
+                    'slot_id': slot_id,
+                    'start_symbol_id': start_symbol_id,
+                    'overall_symbol': overall_symbol,
+                    'direction': direction,
+                    'num_symbols': num_symbols,
+                    'start_prbc': start_prbc,
+                    'num_prbc': num_prbc,
+                    'sym_inc': sym_inc
+                }
             }
             
-            # Add RB exponents array if BFP compression is used
-            if rb_exponents is not None:
-                metadata_entry['rb_exponents'] = rb_exponents
+            # Get packet timestamp
+            try:
+                if hasattr(packet, 'sniff_timestamp'):
+                    packet_data_entry['timestamp'] = float(packet.sniff_timestamp)
+            except:
+                pass
             
-            iq_data[eaxc_id]['metadata'].append(metadata_entry)
+            # Add to current batch
+            current_batch.append(packet_data_entry)
             
-            # Update analysis statistics (same as analyze_pcap)
-            analysis_data['eaxc_ids'].add(eaxc_id)
-            analysis_data['directions'].add(direction)
-            analysis_data['frames'].add(frame_id)
-            analysis_data['subframes'].add(subframe_id)
-            analysis_data['slots'].add(slot_id)
-            analysis_data['symbols'].add(start_symbol_id)
-            analysis_data['total_samples'] += num_samples
-            analysis_data['eaxc_stats'][eaxc_id][direction]['packets'] += 1
-            analysis_data['eaxc_stats'][eaxc_id][direction]['samples'] += num_samples
+            # When batch is full, add to batches list
+            if len(current_batch) >= BATCH_SIZE:
+                packet_batches.append(current_batch)
+                current_batch = []
             
-            # Track symbol counts: use overall_symbol when filtering is active, otherwise use start_symbol_id
-            if start_symbol is not None or end_symbol is not None:
-                # When filtering by overall symbol, track overall symbols
-                analysis_data['overall_symbol_counts'][overall_symbol] += 1
-                # Track samples for this overall symbol
-                analysis_data['overall_symbol_samples'][overall_symbol] += num_samples
-                # Track unique (frame, subframe, slot, symbol, eaxc) combinations per overall symbol
-                combo = (frame_id, subframe_id, slot_id, start_symbol_id, eaxc_id)
-                analysis_data['overall_symbol_unique_combos'][overall_symbol].add(combo)
-                # Track packets per overall symbol per eAxC ID
-                analysis_data['overall_symbol_eaxc_counts'][overall_symbol][eaxc_id] += 1
-            else:
-                # When not filtering, track symbol_ids within slots
-                analysis_data['symbol_counts'][start_symbol_id] += 1
-            
-            analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['packets'] += 1
-            analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['samples'] += num_samples
-            analysis_data['slot_symbol_eaxc_data'][slot_id][start_symbol_id][eaxc_id] += 1
-            frame_slot_data = analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][start_symbol_id][eaxc_id]
-            frame_slot_data['packets'] += 1
-            frame_slot_data['samples'] += num_samples
-            # Store start_prbc and num_prbc (use first non-None value or update if different)
-            if frame_slot_data['start_prbc'] is None:
-                frame_slot_data['start_prbc'] = start_prbc
-            if frame_slot_data['num_prbc'] is None:
-                frame_slot_data['num_prbc'] = num_prbc
-            
-            # Track which RBs have non-zero IQ data (12 samples per RB)
-            # Optimized: Use numpy for faster non-zero detection
-            if len(samples) > 0:
-                samples_per_rb = 12
-                num_rbs_in_samples = len(samples) // samples_per_rb
-                
-                if num_rbs_in_samples > 0:
-                    # Convert samples to numpy array once for efficient processing
-                    samples_array = np.array(samples[:num_rbs_in_samples * samples_per_rb], dtype=complex)
-                    # Reshape to [num_rbs, samples_per_rb] for batch processing
-                    rb_samples_2d = samples_array.reshape(num_rbs_in_samples, samples_per_rb)
-                    # Compute magnitude for each sample, then check if any sample per RB is non-zero
-                    # This is much faster than looping and using 'any()' for each RB
-                    magnitudes = np.abs(rb_samples_2d)
-                    has_nonzero_per_rb = np.any(magnitudes > 1e-10, axis=1)
-                    
-                    # Only iterate through RBs that have non-zero data
-                    for rb_idx in np.where(has_nonzero_per_rb)[0]:
-                        actual_rb_index = start_prbc + rb_idx
-                        frame_slot_data['rbs_with_data'].add(actual_rb_index)
+            # Note: IQ parsing and statistics tracking will happen in Phase 2 (parallel processing)
+            # All packet data has been collected in current_batch
             
         except Exception as e:
             # Skip packets that cause errors
             continue
     
+    # Add remaining packets to a final batch
+    if len(current_batch) > 0:
+        packet_batches.append(current_batch)
+    
     cap.close()
-    print(f"Found {total_packets} total packets\n")
+    print(f"Found {total_packets} total packets")
+    print(f"Collected {len(packet_batches)} batches for parallel processing\n")
+    
+    # Phase 2: Process batches in parallel
+    if len(packet_batches) > 0:
+        print(f"Phase 2: Processing {len(packet_batches)} batches in parallel...")
+        batch_results_list = []
+        
+        # Prepare batch arguments for parallel processing
+        batch_args = [
+            (batch, force_bfp, bfp_exponent, FORCE_COMPRESSION_TYPE, FORCE_BFP_BITWIDTH, ENDIAN)
+            for batch in packet_batches
+        ]
+        
+        # Process batches in parallel
+        max_workers = min(8, len(packet_batches))  # Limit to 8 workers
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all batches
+            future_to_batch = {executor.submit(_process_packet_batch, args): i for i, args in enumerate(batch_args)}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    batch_result = future.result()
+                    batch_results_list.append((batch_idx, batch_result))
+                except Exception as e:
+                    print(f"Error processing batch {batch_idx}: {e}")
+        
+        # Sort results by batch index to maintain order
+        batch_results_list.sort(key=lambda x: x[0])
+        
+        # Phase 3: Merge results from all batches
+        print("Phase 3: Merging results...")
+        for batch_idx, batch_result in batch_results_list:
+            # Process each packet result from the batch
+            for packet_result in batch_result.get('packet_results', []):
+                # Extract data from packet result
+                fields = packet_result['fields']
+                samples = packet_result['samples']
+                compression_type = packet_result['compression_type']
+                num_samples = packet_result['num_samples']
+                exponents_list = packet_result.get('exponents_list')
+                max_i = packet_result['max_i']
+                max_q = packet_result['max_q']
+                max_abs = packet_result['max_abs']
+                eaxc_id = packet_result['eaxc_id']
+                direction = packet_result['direction']
+                frame_id = packet_result['frame_id']
+                subframe_id = packet_result['subframe_id']
+                slot_id = packet_result['slot_id']
+                start_symbol_id = packet_result['start_symbol_id']
+                start_prbc = packet_result['start_prbc']
+                rbs_with_data_list = packet_result.get('rbs_with_data', [])
+                
+                # Get analysis info from packet result (already computed in worker)
+                section_id = packet_result.get('section_id', int(fields.get('sectionId', 0)) if 'sectionId' in fields else 0)
+                ru_port_id = packet_result.get('ru_port_id', fields.get('ru_port_id', 0))
+                num_prbc = packet_result.get('num_prbc', fields.get('num_prbc', None))
+                sym_inc = packet_result.get('sym_inc', fields.get('sym_inc', 0))
+                num_symbols = packet_result.get('num_symbols', sym_inc + 1 if sym_inc > 0 else 1)
+                
+                # Calculate overall_symbol
+                overall_symbol = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                                (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                                (slot_id * SYMBOLS_PER_SLOT) + \
+                                start_symbol_id
+                
+                # Store samples
+                if len(samples) > 0:
+                    iq_data[eaxc_id][direction].extend(samples)
+                
+                # Track compression type
+                analysis_data['compression_types'].add(compression_type)
+                
+                # Update max IQ values
+                if max_abs > max_iq_values[eaxc_id]['max_abs']:
+                    max_iq_values[eaxc_id]['max_i'] = max_i
+                    max_iq_values[eaxc_id]['max_q'] = max_q
+                    max_iq_values[eaxc_id]['max_abs'] = max_abs
+                
+                if max_abs > analysis_data['max_iq_values'][eaxc_id]['max_abs']:
+                    analysis_data['max_iq_values'][eaxc_id]['max_i'] = max_i
+                    analysis_data['max_iq_values'][eaxc_id]['max_q'] = max_q
+                    analysis_data['max_iq_values'][eaxc_id]['max_abs'] = max_abs
+                
+                # Get exponents for metadata
+                rb_exponents = None
+                if compression_type.startswith('BFP') and exponents_list is not None:
+                    rb_exponents = [int(exp) for exp in exponents_list]
+                
+                # Store metadata
+                metadata_entry = {
+                    'direction': direction,
+                    'eaxc_id': eaxc_id,
+                    'section_id': section_id,
+                    'ru_port_id': ru_port_id,
+                    'frame_id': frame_id,
+                    'subframe_id': subframe_id,
+                    'slot_id': slot_id,
+                    'start_symbol_id': start_symbol_id,
+                    'num_symbols': num_symbols,
+                    'start_prbc': start_prbc,
+                    'num_prbc': num_prbc,
+                    'sym_inc': sym_inc,
+                    'num_samples': num_samples,
+                    'compression_type': compression_type,
+                    'compression_method': fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0),
+                    'compression_width': fields.get('compression_width', FORCE_BFP_BITWIDTH)
+                }
+                
+                if rb_exponents is not None:
+                    metadata_entry['rb_exponents'] = rb_exponents
+                
+                iq_data[eaxc_id]['metadata'].append(metadata_entry)
+                
+                # Update analysis statistics
+                analysis_data['eaxc_ids'].add(eaxc_id)
+                analysis_data['directions'].add(direction)
+                analysis_data['frames'].add(frame_id)
+                analysis_data['subframes'].add(subframe_id)
+                analysis_data['slots'].add(slot_id)
+                analysis_data['symbols'].add(start_symbol_id)
+                analysis_data['total_samples'] += num_samples
+                analysis_data['eaxc_stats'][eaxc_id][direction]['packets'] += 1
+                analysis_data['eaxc_stats'][eaxc_id][direction]['samples'] += num_samples
+                
+                # Track symbol counts
+                if start_symbol is not None or end_symbol is not None:
+                    analysis_data['overall_symbol_counts'][overall_symbol] += 1
+                    analysis_data['overall_symbol_samples'][overall_symbol] += num_samples
+                    combo = (frame_id, subframe_id, slot_id, start_symbol_id, eaxc_id)
+                    analysis_data['overall_symbol_unique_combos'][overall_symbol].add(combo)
+                    analysis_data['overall_symbol_eaxc_counts'][overall_symbol][eaxc_id] += 1
+                else:
+                    analysis_data['symbol_counts'][start_symbol_id] += 1
+                
+                analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['packets'] += 1
+                analysis_data['symbol_eaxc_data'][start_symbol_id][eaxc_id]['samples'] += num_samples
+                analysis_data['slot_symbol_eaxc_data'][slot_id][start_symbol_id][eaxc_id] += 1
+                
+                frame_slot_data = analysis_data['frame_subframe_slot_symbol_eaxc_data'][frame_id][subframe_id][slot_id][start_symbol_id][eaxc_id]
+                frame_slot_data['packets'] += 1
+                frame_slot_data['samples'] += num_samples
+                if frame_slot_data['start_prbc'] is None:
+                    frame_slot_data['start_prbc'] = start_prbc
+                if frame_slot_data['num_prbc'] is None:
+                    frame_slot_data['num_prbc'] = num_prbc
+                
+                # Track RBs with data
+                rbs_with_data = set(rbs_with_data_list)
+                if len(samples) > 0 and len(rbs_with_data) > 0:
+                    for rb_index in rbs_with_data:
+                        frame_slot_data['rbs_with_data'].add(rb_index)
+        
+        # Add timestamps from original batch entries
+        for batch_idx, batch in enumerate(packet_batches):
+            for packet_data_entry in batch:
+                timestamp = packet_data_entry.get('timestamp')
+                if timestamp is not None:
+                    analysis_data['packet_timestamps'].append(timestamp)
+        
+        print("Merging complete.\n")
     
     # Return both IQ data and analysis data
     return iq_data, analysis_data, total_packets
@@ -1307,16 +1780,33 @@ def save_separated_data(iq_data, output_base):
             
             # Save UL statistics
             avg_power = np.mean(np.abs(ul_array)**2)
-            full_scale_power = 32767.0 ** 2  # Full scale power for 16-bit signed integers
+            peak_power = np.max(np.abs(ul_array)**2)
+            full_scale = 32767.0  # Full scale for 16-bit signed integers
+            full_scale_power = full_scale ** 2
             avg_power_dbfs = 10 * math.log10(avg_power / full_scale_power) if avg_power > 0 else float('-inf')
+            peak_power_dbfs = 10 * math.log10(peak_power / full_scale_power) if peak_power > 0 else float('-inf')
+            
+            # Calculate I and Q statistics in dBFS
+            i_mean_abs = np.mean(np.abs(ul_array.real))
+            i_max_abs = np.max(np.abs(ul_array.real))
+            i_mean_dbfs = 20 * math.log10(i_mean_abs / full_scale) if i_mean_abs > 0 else float('-inf')
+            i_max_dbfs = 20 * math.log10(i_max_abs / full_scale) if i_max_abs > 0 else float('-inf')
+            
+            q_mean_abs = np.mean(np.abs(ul_array.imag))
+            q_max_abs = np.max(np.abs(ul_array.imag))
+            q_mean_dbfs = 20 * math.log10(q_mean_abs / full_scale) if q_mean_abs > 0 else float('-inf')
+            q_max_dbfs = 20 * math.log10(q_max_abs / full_scale) if q_max_abs > 0 else float('-inf')
+            
             with open(f"{filename}_stats.txt", 'w') as f:
                 f.write(f"eAxC ID: {eaxc_id}\n")
                 f.write(f"Direction: Uplink (UL)\n")
                 f.write(f"Total samples: {len(ul_array):,}\n")
-                f.write(f"I - Mean: {np.mean(ul_array.real):.2f}, Std: {np.std(ul_array.real):.2f}\n")
-                f.write(f"Q - Mean: {np.mean(ul_array.imag):.2f}, Std: {np.std(ul_array.imag):.2f}\n")
-                f.write(f"Magnitude - Mean: {np.mean(np.abs(ul_array)):.2f}, Max: {np.max(np.abs(ul_array)):.2f}\n")
+                f.write(f"I - Mean: {i_mean_abs:.2f}, Max: {i_max_abs:.2f}\n")
+                f.write(f"I - Mean (dBFS): {i_mean_dbfs:.2f}, Max (dBFS): {i_max_dbfs:.2f}\n")
+                f.write(f"Q - Mean: {q_mean_abs:.2f}, Max: {q_max_abs:.2f}\n")
+                f.write(f"Q - Mean (dBFS): {q_mean_dbfs:.2f}, Max (dBFS): {q_max_dbfs:.2f}\n")
                 f.write(f"Average Power: {avg_power_dbfs:.2f} dBFS\n")
+                f.write(f"Peak Power: {peak_power_dbfs:.2f} dBFS\n")
         
         # Save DL data
         if len(iq_data[eaxc_id]['DL']) > 0:
@@ -1327,16 +1817,33 @@ def save_separated_data(iq_data, output_base):
             
             # Save DL statistics
             avg_power = np.mean(np.abs(dl_array)**2)
-            full_scale_power = 32767.0 ** 2  # Full scale power for 16-bit signed integers
+            peak_power = np.max(np.abs(dl_array)**2)
+            full_scale = 32767.0  # Full scale for 16-bit signed integers
+            full_scale_power = full_scale ** 2
             avg_power_dbfs = 10 * math.log10(avg_power / full_scale_power) if avg_power > 0 else float('-inf')
+            peak_power_dbfs = 10 * math.log10(peak_power / full_scale_power) if peak_power > 0 else float('-inf')
+            
+            # Calculate I and Q statistics in dBFS
+            i_mean_abs = np.mean(np.abs(dl_array.real))
+            i_max_abs = np.max(np.abs(dl_array.real))
+            i_mean_dbfs = 20 * math.log10(i_mean_abs / full_scale) if i_mean_abs > 0 else float('-inf')
+            i_max_dbfs = 20 * math.log10(i_max_abs / full_scale) if i_max_abs > 0 else float('-inf')
+            
+            q_mean_abs = np.mean(np.abs(dl_array.imag))
+            q_max_abs = np.max(np.abs(dl_array.imag))
+            q_mean_dbfs = 20 * math.log10(q_mean_abs / full_scale) if q_mean_abs > 0 else float('-inf')
+            q_max_dbfs = 20 * math.log10(q_max_abs / full_scale) if q_max_abs > 0 else float('-inf')
+            
             with open(f"{filename}_stats.txt", 'w') as f:
                 f.write(f"eAxC ID: {eaxc_id}\n")
                 f.write(f"Direction: Downlink (DL)\n")
                 f.write(f"Total samples: {len(dl_array):,}\n")
-                f.write(f"I - Mean: {np.mean(dl_array.real):.2f}, Std: {np.std(dl_array.real):.2f}\n")
-                f.write(f"Q - Mean: {np.mean(dl_array.imag):.2f}, Std: {np.std(dl_array.imag):.2f}\n")
-                f.write(f"Magnitude - Mean: {np.mean(np.abs(dl_array)):.2f}, Max: {np.max(np.abs(dl_array)):.2f}\n")
+                f.write(f"I - Mean: {i_mean_abs:.2f}, Max: {i_max_abs:.2f}\n")
+                f.write(f"I - Mean (dBFS): {i_mean_dbfs:.2f}, Max (dBFS): {i_max_dbfs:.2f}\n")
+                f.write(f"Q - Mean: {q_mean_abs:.2f}, Max: {q_max_abs:.2f}\n")
+                f.write(f"Q - Mean (dBFS): {q_mean_dbfs:.2f}, Max (dBFS): {q_max_dbfs:.2f}\n")
                 f.write(f"Average Power: {avg_power_dbfs:.2f} dBFS\n")
+                f.write(f"Peak Power: {peak_power_dbfs:.2f} dBFS\n")
         
         # Save metadata
         metadata_file = f"{output_base}_eAxC{eaxc_id}_metadata.json"
@@ -1640,15 +2147,157 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     first_frame_subframe_slot = None
     
     try:
+        # First, read and display current ORAN FH CUS protocol preferences
+        print("\nCurrent ORAN FH CUS protocol preferences:")
+        print("-" * 60)
+        pref_names = [
+            'oran_fh_cus.oran.ud_comp_up',
+            'oran_fh_cus.oran.iq_bitwidth_up',
+            'oran_fh_cus.oran.ud_comp_down',
+            'oran_fh_cus.oran.iq_bitwidth_down',
+        ]
+        
+        current_prefs = {}
+        try:
+            result = subprocess.run(
+                ['tshark', '-G', 'defaultprefs'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            for pref_name in pref_names:
+                for line in result.stdout.split('\n'):
+                    if line.strip().startswith('#' + pref_name + ':'):
+                        value = line.split(':', 1)[1].strip() if ':' in line else 'Unknown'
+                        current_prefs[pref_name] = value
+                        print(f"  {pref_name}: {value}")
+                        break
+        except Exception as e:
+            print(f"  Warning: Could not read current preferences: {e}")
+        
+        print("-" * 60)
+        
+        # Set ORAN FH CUS protocol preferences based on compression type
+        # This ensures Wireshark/TShark dissects packets correctly
+        # Use override_prefs (dictionary) instead of custom_parameters (command-line flags)
+        # for a cleaner Python API
+        
+        # Set compression method preference for ORAN FH CUS
+        # Use string values as specified in TShark preferences (case-insensitive)
+        # Valid values: "COMP_NONE", "COMP_BLOCK_FP", "No Compression", "Block Floating Point Compression", etc.
+        if FORCE_COMPRESSION_TYPE.upper() == 'BFP':
+            compression_pref = 'COMP_BLOCK_FP'  # or 'Block Floating Point Compression'
+            iq_bitwidth = str(FORCE_BFP_BITWIDTH)
+        else:
+            compression_pref = 'COMP_NONE'  # or 'No Compression'
+            iq_bitwidth = '16'
+        
+        # Create dictionary of ORAN FH CUS preferences for both uplink and downlink
+        # override_prefs expects string values
+        override_prefs = {
+            'oran_fh_cus.oran.ud_comp_up': compression_pref,
+            'oran_fh_cus.oran.iq_bitwidth_up': iq_bitwidth,
+            'oran_fh_cus.oran.ud_comp_down': compression_pref,
+            'oran_fh_cus.oran.iq_bitwidth_down': iq_bitwidth,
+        }
+        
+        print(f"\nSetting ORAN FH CUS protocol preferences (based on FORCE_COMPRESSION_TYPE='{FORCE_COMPRESSION_TYPE}'):")
+        print("-" * 60)
+        for pref_name, pref_value in override_prefs.items():
+            if "ud_comp" in pref_name:
+                if pref_value == "COMP_BLOCK_FP" or pref_value == "Block Floating Point Compression":
+                    comp_desc = "Block Floating Point Compression"
+                elif pref_value == "COMP_NONE" or pref_value == "No Compression":
+                    comp_desc = "No Compression"
+                else:
+                    comp_desc = pref_value
+                print(f"  {pref_name}: {comp_desc} ({pref_value})")
+            else:
+                print(f"  {pref_name}: {pref_value}")
+        print("-" * 60)
+        print()
+        
+        # Set decode_as to decode UDP packets as ORAN FH CUS
+        # This ensures packets are properly dissected even if not auto-detected
+        decode_as = None  # Disable decode_as to avoid TShark crashes - let Wireshark auto-detect
+        # If you know the specific UDP port, uncomment and set it:
+        # decode_as = {'udp.port==1234': 'oran_fh_cus'}  # Replace 1234 with actual port
+        print("decode_as: Using Wireshark auto-detection for ORAN FH CUS protocol")
+        print("  (If packets aren't detected, specify decode_as with known UDP port)")
+        print()
+        
+        # IMPORTANT: Use custom_parameters with -o flags to ensure preferences are actually applied
+        # override_prefs may not always work correctly, so we'll use both methods
+        # Build custom_parameters list with -o flags for preferences (more reliable)
+        custom_params = []
+        for pref_name, pref_value in override_prefs.items():
+            custom_params.extend(['-o', f'{pref_name}:{pref_value}'])
+        
+        print("Also setting preferences via custom_parameters (-o flags) for reliability:")
+        print("-" * 60)
+        for i in range(0, len(custom_params), 2):
+            if i+1 < len(custom_params):
+                print(f"  {custom_params[i]} {custom_params[i+1]}")
+        print("-" * 60)
+        print()
+        
         # Try with use_json and include_raw for better raw data access
         # Don't use display filter as it can cause TShark crashes
         try:
-            cap = pyshark.FileCapture(pcap_file, use_json=True, include_raw=True)
+            cap = pyshark.FileCapture(
+                pcap_file, 
+                use_json=True, 
+                include_raw=True,
+                override_prefs=override_prefs,
+                custom_parameters=custom_params if custom_params else None,
+                decode_as=decode_as if decode_as else {}
+            )
         except:
             try:
-                cap = pyshark.FileCapture(pcap_file, use_json=True)
+                cap = pyshark.FileCapture(
+                    pcap_file, 
+                    use_json=True,
+                    override_prefs=override_prefs,
+                    custom_parameters=custom_params if custom_params else None,
+                    decode_as=decode_as if decode_as else {}
+                )
             except:
-                cap = pyshark.FileCapture(pcap_file)
+                try:
+                    cap = pyshark.FileCapture(
+                        pcap_file,
+                        override_prefs=override_prefs,
+                        custom_parameters=custom_params if custom_params else None,
+                        decode_as=decode_as if decode_as else {}
+                    )
+                except:
+                    # Last resort: basic capture without preferences
+                    cap = pyshark.FileCapture(pcap_file)
+        
+        # Verify preferences were set by querying them again
+        print("Verifying ORAN FH CUS protocol preferences (session-specific):")
+        print("-" * 60)
+        try:
+            # Note: These preferences are session-specific to this FileCapture instance
+            # We can't directly query what FileCapture is using, but we can show what
+            # preferences were applied to this session
+            print("  Preferences applied to this session:")
+            for pref_name, pref_value in override_prefs.items():
+                if "ud_comp" in pref_name:
+                    if pref_value == "COMP_BLOCK_FP" or pref_value == "Block Floating Point Compression":
+                        comp_desc = "Block Floating Point Compression"
+                    elif pref_value == "COMP_NONE" or pref_value == "No Compression":
+                        comp_desc = "No Compression"
+                    else:
+                        comp_desc = pref_value
+                    print(f"    {pref_name}: {comp_desc} ({pref_value})")
+                else:
+                    print(f"    {pref_name}: {pref_value}")
+            print("  (Note: These preferences are active for this FileCapture session only)")
+        except Exception as e:
+            print(f"  Warning: Could not verify preferences: {e}")
+        print("-" * 60)
+        print()
     except Exception as e:
         print(f"Error opening pcap file: {e}")
         return {}
@@ -2443,4 +3092,5 @@ if __name__ == "__main__":
     end_time = time.time()
     execution_time = end_time - start_time
     print(f"\nExecution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
+
 
