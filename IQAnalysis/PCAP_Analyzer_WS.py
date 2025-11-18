@@ -970,9 +970,12 @@ def _process_packet_batch(args):
     
     return batch_results
 
-def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False):
+def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False, use_parallel=True):
     """Extract IQ samples with direction and eAxC ID information using pyshark.
     Also collects analysis statistics for reporting.
+    
+    Args:
+        use_parallel: If True, use parallel processing for packet batches. If False, process sequentially.
     
     Returns:
         tuple: (iq_data, analysis_data, total_packets)
@@ -1454,36 +1457,46 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
     
     cap.close()
     print(f"Found {total_packets} total packets")
-    print(f"Collected {len(packet_batches)} batches for parallel processing\n")
+    print(f"Collected {len(packet_batches)} batches for processing\n")
     
-    # Phase 2: Process batches in parallel
+    # Phase 2: Process batches (parallel or sequential based on use_parallel flag)
     if len(packet_batches) > 0:
-        print(f"Phase 2: Processing {len(packet_batches)} batches in parallel...")
         batch_results_list = []
         
-        # Prepare batch arguments for parallel processing
+        # Prepare batch arguments
         batch_args = [
             (batch, force_bfp, bfp_exponent, FORCE_COMPRESSION_TYPE, FORCE_BFP_BITWIDTH, ENDIAN)
             for batch in packet_batches
         ]
         
-        # Process batches in parallel
-        max_workers = min(8, len(packet_batches))  # Limit to 8 workers
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all batches
-            future_to_batch = {executor.submit(_process_packet_batch, args): i for i, args in enumerate(batch_args)}
+        if use_parallel:
+            print(f"Phase 2: Processing {len(packet_batches)} batches in parallel...")
+            # Process batches in parallel
+            max_workers = min(8, len(packet_batches))  # Limit to 8 workers
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all batches
+                future_to_batch = {executor.submit(_process_packet_batch, args): i for i, args in enumerate(batch_args)}
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_batch):
+                    batch_idx = future_to_batch[future]
+                    try:
+                        batch_result = future.result()
+                        batch_results_list.append((batch_idx, batch_result))
+                    except Exception as e:
+                        print(f"Error processing batch {batch_idx}: {e}")
             
-            # Collect results as they complete
-            for future in as_completed(future_to_batch):
-                batch_idx = future_to_batch[future]
+            # Sort results by batch index to maintain order
+            batch_results_list.sort(key=lambda x: x[0])
+        else:
+            print(f"Phase 2: Processing {len(packet_batches)} batches sequentially...")
+            # Process batches sequentially
+            for batch_idx, args in enumerate(batch_args):
                 try:
-                    batch_result = future.result()
+                    batch_result = _process_packet_batch(args)
                     batch_results_list.append((batch_idx, batch_result))
                 except Exception as e:
                     print(f"Error processing batch {batch_idx}: {e}")
-        
-        # Sort results by batch index to maintain order
-        batch_results_list.sort(key=lambda x: x[0])
         
         # Phase 3: Merge results from all batches
         print("Phase 3: Merging results...")
@@ -2970,6 +2983,8 @@ if __name__ == "__main__":
                        help='Force BFP decompression')
     parser.add_argument('--bfp-exponent', type=int, metavar='N',
                        help='BFP exponent value (0-15)')
+    parser.add_argument('--no-parallel', action='store_true',
+                       help='Disable parallel processing (process packets sequentially)')
     
     args = parser.parse_args()
     
@@ -3005,9 +3020,11 @@ if __name__ == "__main__":
     restrict_to_first = (args.symbols is not None and args.symbols > 0)
     
     # Extract IQ samples with metadata (also collects analysis data in a single pass)
+    use_parallel = not args.no_parallel  # Default to parallel, disable if --no-parallel is set
     iq_data, analysis_data, total_packets = extract_iq_with_metadata(
         args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent,
-        start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first)
+        start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first,
+        use_parallel=use_parallel)
     
     if len(iq_data) == 0:
         print("No IQ data found!")
