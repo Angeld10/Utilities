@@ -2225,22 +2225,38 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
         print("No eAxC ID with both UL and DL data for comparison plot")
         return
     
+    # Get all samples first
+    ul_all_array = np.array(iq_data[eaxc_with_both]['UL'])
+    dl_all_array = np.array(iq_data[eaxc_with_both]['DL'])
+    ul_total_count = len(ul_all_array)
+    dl_total_count = len(dl_all_array)
+    
     # Get samples, filtering by symbol range if specified
     if start_symbol is not None or end_symbol is not None:
         ul_mask = get_sample_mask_for_symbols(iq_data, eaxc_with_both, 'UL', start_symbol, end_symbol)
         dl_mask = get_sample_mask_for_symbols(iq_data, eaxc_with_both, 'DL', start_symbol, end_symbol)
-        ul_all = np.array(iq_data[eaxc_with_both]['UL'])
-        dl_all = np.array(iq_data[eaxc_with_both]['DL'])
-        ul_samples = ul_all[ul_mask]
-        dl_samples = dl_all[dl_mask]
-        # Apply max_samples limit if needed
-        if len(ul_samples) > max_samples:
-            ul_samples = ul_samples[:max_samples]
-        if len(dl_samples) > max_samples:
-            dl_samples = dl_samples[:max_samples]
+        ul_samples = ul_all_array[ul_mask]
+        dl_samples = dl_all_array[dl_mask]
+        # Apply max_samples limit if needed (0 means plot all)
+        if max_samples > 0:
+            if len(ul_samples) > max_samples:
+                ul_samples = ul_samples[:max_samples]
+            if len(dl_samples) > max_samples:
+                dl_samples = dl_samples[:max_samples]
     else:
-        ul_samples = np.array(iq_data[eaxc_with_both]['UL'][:max_samples])
-        dl_samples = np.array(iq_data[eaxc_with_both]['DL'][:max_samples])
+        # Apply max_samples limit if needed (0 means plot all)
+        if max_samples > 0:
+            if ul_total_count > max_samples:
+                ul_samples = ul_all_array[:max_samples]
+            else:
+                ul_samples = ul_all_array
+            if dl_total_count > max_samples:
+                dl_samples = dl_all_array[:max_samples]
+            else:
+                dl_samples = dl_all_array
+        else:
+            ul_samples = ul_all_array
+            dl_samples = dl_all_array
     
     # Create title with symbol range if specified
     title = f'UL vs DL Comparison (eAxC ID: {eaxc_with_both})'
@@ -2248,44 +2264,84 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
         symbol_range = f"Symbols {start_symbol if start_symbol is not None else 0}-{end_symbol if end_symbol is not None else 'end'}"
         title += f" - {symbol_range}"
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(title, fontsize=14, fontweight='bold')
+    # Add sample count info to title
+    ul_plotted = len(ul_samples)
+    dl_plotted = len(dl_samples)
+    if start_symbol is not None or end_symbol is not None:
+        # When filtering, show filtered counts
+        title += f"\n(UL: {ul_plotted:,} samples, DL: {dl_plotted:,} samples)"
+    else:
+        # Show plotted vs total
+        if ul_plotted < ul_total_count or dl_plotted < dl_total_count:
+            title += f"\n(UL: {ul_plotted:,} of {ul_total_count:,}, DL: {dl_plotted:,} of {dl_total_count:,} samples shown)"
+        else:
+            title += f"\n(UL: {ul_total_count:,}, DL: {dl_total_count:,} samples)"
     
-    # UL Constellation
-    axes[0, 0].scatter(ul_samples.real, ul_samples.imag, alpha=0.3, s=1, c='blue')
-    axes[0, 0].set_xlabel('I (In-phase)')
-    axes[0, 0].set_ylabel('Q (Quadrature)')
-    axes[0, 0].set_title(f'Uplink Constellation ({len(ul_samples):,} samples)')
-    axes[0, 0].grid(True, alpha=0.3)
-    axes[0, 0].axis('equal')
-    
-    # DL Constellation
-    axes[0, 1].scatter(dl_samples.real, dl_samples.imag, alpha=0.3, s=1, c='red')
-    axes[0, 1].set_xlabel('I (In-phase)')
-    axes[0, 1].set_ylabel('Q (Quadrature)')
-    axes[0, 1].set_title(f'Downlink Constellation ({len(dl_samples):,} samples)')
-    axes[0, 1].grid(True, alpha=0.3)
-    axes[0, 1].axis('equal')
-    
-    # UL Magnitude
+    # Create Magnitude comparison plot
     ul_mag = np.abs(ul_samples)
-    axes[1, 0].plot(ul_mag, color='blue', alpha=0.7)
-    axes[1, 0].set_xlabel('Sample Index')
-    axes[1, 0].set_ylabel('Magnitude')
-    axes[1, 0].set_title(f'Uplink Magnitude (Mean: {np.mean(ul_mag):.1f})')
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # DL Magnitude
     dl_mag = np.abs(dl_samples)
-    axes[1, 1].plot(dl_mag, color='red', alpha=0.7)
-    axes[1, 1].set_xlabel('Sample Index')
-    axes[1, 1].set_ylabel('Magnitude')
-    axes[1, 1].set_title(f'Downlink Magnitude (Mean: {np.mean(dl_mag):.1f})')
-    axes[1, 1].grid(True, alpha=0.3)
+    
+    fig_mag, axes_mag = plt.subplots(2, 1, figsize=(12, 10))
+    fig_mag.suptitle(f'{title} - Magnitude', fontsize=14, fontweight='bold')
+    
+    axes_mag[0].plot(ul_mag, color='blue', alpha=0.7)
+    axes_mag[0].set_xlabel('Sample Index')
+    axes_mag[0].set_ylabel('Magnitude')
+    axes_mag[0].set_title(f'Uplink Magnitude (Mean: {np.mean(ul_mag):.1f})')
+    axes_mag[0].grid(True, alpha=0.3)
+    
+    axes_mag[1].plot(dl_mag, color='red', alpha=0.7)
+    axes_mag[1].set_xlabel('Sample Index')
+    axes_mag[1].set_ylabel('Magnitude')
+    axes_mag[1].set_title(f'Downlink Magnitude (Mean: {np.mean(dl_mag):.1f})')
+    axes_mag[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(output_file, dpi=200, bbox_inches='tight')
-    print(f"Saved comparison plot: {output_file}\n")
+    mag_output_file = output_file.replace('.png', '_magnitude.png')
+    plt.savefig(mag_output_file, dpi=200, bbox_inches='tight')
+    print(f"Saved magnitude comparison plot: {mag_output_file}")
+    plt.close()
+    
+    # Create Constellation comparison plot
+    # UL Constellation - downsample if very large
+    if len(ul_samples) > 50000:
+        downsample_factor = len(ul_samples) // 50000
+        ul_const_samples = ul_samples[::downsample_factor]
+        ul_const_title = f'Uplink Constellation (showing {len(ul_const_samples):,} of {len(ul_samples):,} samples)'
+    else:
+        ul_const_samples = ul_samples
+        ul_const_title = f'Uplink Constellation ({len(ul_samples):,} samples)'
+    
+    # DL Constellation - downsample if very large
+    if len(dl_samples) > 50000:
+        downsample_factor = len(dl_samples) // 50000
+        dl_const_samples = dl_samples[::downsample_factor]
+        dl_const_title = f'Downlink Constellation (showing {len(dl_const_samples):,} of {len(dl_samples):,} samples)'
+    else:
+        dl_const_samples = dl_samples
+        dl_const_title = f'Downlink Constellation ({len(dl_samples):,} samples)'
+    
+    fig_const, axes_const = plt.subplots(1, 2, figsize=(14, 7))
+    fig_const.suptitle(f'{title} - Constellation', fontsize=14, fontweight='bold')
+    
+    axes_const[0].scatter(ul_const_samples.real, ul_const_samples.imag, alpha=0.3, s=1, c='blue')
+    axes_const[0].set_xlabel('I (In-phase)')
+    axes_const[0].set_ylabel('Q (Quadrature)')
+    axes_const[0].set_title(ul_const_title)
+    axes_const[0].grid(True, alpha=0.3)
+    axes_const[0].axis('equal')
+    
+    axes_const[1].scatter(dl_const_samples.real, dl_const_samples.imag, alpha=0.3, s=1, c='red')
+    axes_const[1].set_xlabel('I (In-phase)')
+    axes_const[1].set_ylabel('Q (Quadrature)')
+    axes_const[1].set_title(dl_const_title)
+    axes_const[1].grid(True, alpha=0.3)
+    axes_const[1].axis('equal')
+    
+    plt.tight_layout()
+    const_output_file = output_file.replace('.png', '_constellation.png')
+    plt.savefig(const_output_file, dpi=200, bbox_inches='tight')
+    print(f"Saved constellation comparison plot: {const_output_file}\n")
     plt.close()
 
 def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None):
@@ -2304,16 +2360,23 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
             if len(iq_data[eaxc_id][direction]) == 0:
                 continue
             
+            # Get all samples first
+            all_samples_array = np.array(iq_data[eaxc_id][direction])
+            total_samples_count = len(all_samples_array)
+            
             # Get samples, filtering by symbol range if specified
             if start_symbol is not None or end_symbol is not None:
                 mask = get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol, end_symbol)
-                all_samples = np.array(iq_data[eaxc_id][direction])
-                samples = all_samples[mask]
-                # Apply max_samples limit if needed
-                if len(samples) > max_samples:
+                samples = all_samples_array[mask]
+                # Apply max_samples limit if needed (0 means plot all)
+                if max_samples > 0 and len(samples) > max_samples:
                     samples = samples[:max_samples]
             else:
-                samples = np.array(iq_data[eaxc_id][direction][:max_samples])
+                # Apply max_samples limit if needed (0 means plot all)
+                if max_samples > 0 and total_samples_count > max_samples:
+                    samples = all_samples_array[:max_samples]
+                else:
+                    samples = all_samples_array
             
             # Create title with symbol range if specified
             title = f'eAxC ID: {eaxc_id} - {direction}'
@@ -2321,46 +2384,50 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
                 symbol_range = f"Symbols {start_symbol if start_symbol is not None else 0}-{end_symbol if end_symbol is not None else 'end'}"
                 title += f" - {symbol_range}"
             
-            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle(title, fontsize=14, fontweight='bold')
+            # Add sample count info to title
+            samples_plotted = len(samples)
+            if samples_plotted < total_samples_count:
+                sample_info = f"({samples_plotted:,} of {total_samples_count:,} samples shown)"
+            else:
+                sample_info = f"({total_samples_count:,} samples)"
             
-            # I/Q Time Domain
-            axes[0, 0].plot(samples.real, label='I', alpha=0.7)
-            axes[0, 0].plot(samples.imag, label='Q', alpha=0.7)
-            axes[0, 0].set_xlabel('Sample Index')
-            axes[0, 0].set_ylabel('Amplitude')
-            axes[0, 0].set_title('I/Q Time Domain')
-            axes[0, 0].legend()
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # Magnitude
+            # Create Magnitude plot
             magnitude = np.abs(samples)
-            axes[0, 1].plot(magnitude, color='purple')
-            axes[0, 1].set_xlabel('Sample Index')
-            axes[0, 1].set_ylabel('Magnitude')
-            axes[0, 1].set_title(f'Magnitude (Mean: {np.mean(magnitude):.1f})')
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # Phase
-            phase = np.angle(samples)
-            axes[1, 0].plot(phase, color='green')
-            axes[1, 0].set_xlabel('Sample Index')
-            axes[1, 0].set_ylabel('Phase (radians)')
-            axes[1, 0].set_title('Phase')
-            axes[1, 0].grid(True, alpha=0.3)
-            
-            # Constellation
-            axes[1, 1].scatter(samples.real, samples.imag, alpha=0.3, s=1)
-            axes[1, 1].set_xlabel('I (In-phase)')
-            axes[1, 1].set_ylabel('Q (Quadrature)')
-            axes[1, 1].set_title('Constellation Diagram')
-            axes[1, 1].grid(True, alpha=0.3)
-            axes[1, 1].axis('equal')
-            
+            fig_mag, ax_mag = plt.subplots(1, 1, figsize=(10, 6))
+            ax_mag.plot(magnitude, color='purple')
+            ax_mag.set_xlabel('Sample Index')
+            ax_mag.set_ylabel('Magnitude')
+            ax_mag.set_title(f'{title} - Magnitude\n{sample_info}\nMean: {np.mean(magnitude):.1f}')
+            ax_mag.grid(True, alpha=0.3)
             plt.tight_layout()
-            plot_file = os.path.join(plots_dir, f"{output_base}_eAxC{eaxc_id}_{direction}.png")
-            plt.savefig(plot_file, dpi=150, bbox_inches='tight')
-            print(f"Saved plot: {plot_file}")
+            plot_file_mag = os.path.join(plots_dir, f"{output_base}_eAxC{eaxc_id}_{direction}_magnitude.png")
+            plt.savefig(plot_file_mag, dpi=150, bbox_inches='tight')
+            print(f"Saved magnitude plot: {plot_file_mag}")
+            plt.close()
+            
+            # Create Constellation plot
+            # For very large datasets, use downsampling for visualization to avoid performance issues
+            # but still show a representative sample
+            if len(samples) > 50000:
+                # Downsample for visualization: take every Nth sample
+                downsample_factor = len(samples) // 50000
+                samples_for_const = samples[::downsample_factor]
+                const_title = f'{title} - Constellation\n(showing {len(samples_for_const):,} of {len(samples):,} samples)'
+            else:
+                samples_for_const = samples
+                const_title = f'{title} - Constellation\n{sample_info}'
+            
+            fig_const, ax_const = plt.subplots(1, 1, figsize=(10, 10))
+            ax_const.scatter(samples_for_const.real, samples_for_const.imag, alpha=0.3, s=1)
+            ax_const.set_xlabel('I (In-phase)')
+            ax_const.set_ylabel('Q (Quadrature)')
+            ax_const.set_title(const_title)
+            ax_const.grid(True, alpha=0.3)
+            ax_const.axis('equal')
+            plt.tight_layout()
+            plot_file_const = os.path.join(plots_dir, f"{output_base}_eAxC{eaxc_id}_{direction}_constellation.png")
+            plt.savefig(plot_file_const, dpi=150, bbox_inches='tight')
+            print(f"Saved constellation plot: {plot_file_const}")
             plt.close()
     
     print()
@@ -3242,8 +3309,8 @@ if __name__ == "__main__":
                        help='Base name for output files (default: iq_separated)')
     parser.add_argument('--symbols', type=int, metavar='N',
                        help='Number of overall symbols to analyze/plot (across all slots)')
-    parser.add_argument('--samples', type=int, default=10000, metavar='N',
-                       help='Number of samples to plot (default: 10000)')
+    parser.add_argument('--samples', type=int, default=0, metavar='N',
+                       help='Number of samples to plot (default: 0, use 0 to plot all samples)')
     parser.add_argument('--start-symbol', type=int, metavar='N',
                        help='Start overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
     parser.add_argument('--end-symbol', type=int, metavar='N',
@@ -3318,7 +3385,8 @@ if __name__ == "__main__":
     
     # Determine max_samples based on symbols or samples parameter
     # Note: start_symbol and end_symbol may have been set by --symbols above
-    max_samples = args.samples
+    # If --samples is 0, it means plot all samples (no limit)
+    max_samples = args.samples if args.samples > 0 else 0
     # Only calculate samples per symbol if --symbols was specified but start/end weren't explicitly set
     if args.symbols is not None and args.start_symbol is None and args.end_symbol is None:
         # Find the first eAxC ID with data to calculate samples per symbol
@@ -3339,7 +3407,10 @@ if __name__ == "__main__":
                                                          direction_for_calc, args.symbols)
             print(f"Plotting {args.symbols} symbols ({max_samples:,} samples)")
         else:
-            print(f"Warning: Could not determine samples per symbol, using default {max_samples:,} samples")
+            if max_samples > 0:
+                print(f"Warning: Could not determine samples per symbol, using default {max_samples:,} samples")
+            else:
+                print(f"Warning: Could not determine samples per symbol, plotting all samples")
     elif start_symbol is not None or end_symbol is not None:
         # Symbol range specified - calculate max_samples for display purposes
         eaxc_id_for_calc = None
@@ -3361,7 +3432,10 @@ if __name__ == "__main__":
             symbol_range_str = f"Symbols {start_symbol if start_symbol is not None else 0}-{end_symbol if end_symbol is not None else 'end'}"
             print(f"Plotting {symbol_range_str} ({max_samples:,} samples)")
         else:
-            print(f"Warning: Could not determine samples per symbol, using default {max_samples:,} samples")
+            if max_samples > 0:
+                print(f"Warning: Could not determine samples per symbol, using default {max_samples:,} samples")
+            else:
+                print(f"Warning: Could not determine samples per symbol, plotting all samples")
     
     # Create comparison plot
     print("Creating comparison plot...")
