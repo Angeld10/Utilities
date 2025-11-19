@@ -2302,36 +2302,21 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     print(f"Saved magnitude comparison plot: {mag_output_file}")
     plt.close()
     
-    # Create Constellation comparison plot
-    # UL Constellation - downsample if very large
-    if len(ul_samples) > 50000:
-        downsample_factor = len(ul_samples) // 50000
-        ul_const_samples = ul_samples[::downsample_factor]
-        ul_const_title = f'Uplink Constellation (showing {len(ul_const_samples):,} of {len(ul_samples):,} samples)'
-    else:
-        ul_const_samples = ul_samples
-        ul_const_title = f'Uplink Constellation ({len(ul_samples):,} samples)'
-    
-    # DL Constellation - downsample if very large
-    if len(dl_samples) > 50000:
-        downsample_factor = len(dl_samples) // 50000
-        dl_const_samples = dl_samples[::downsample_factor]
-        dl_const_title = f'Downlink Constellation (showing {len(dl_const_samples):,} of {len(dl_samples):,} samples)'
-    else:
-        dl_const_samples = dl_samples
-        dl_const_title = f'Downlink Constellation ({len(dl_samples):,} samples)'
+    # Create Constellation comparison plot - plot all samples
+    ul_const_title = f'Uplink Constellation ({len(ul_samples):,} samples)'
+    dl_const_title = f'Downlink Constellation ({len(dl_samples):,} samples)'
     
     fig_const, axes_const = plt.subplots(1, 2, figsize=(14, 7))
     fig_const.suptitle(f'{title} - Constellation', fontsize=14, fontweight='bold')
     
-    axes_const[0].scatter(ul_const_samples.real, ul_const_samples.imag, alpha=0.3, s=1, c='blue')
+    axes_const[0].scatter(ul_samples.real, ul_samples.imag, alpha=0.3, s=1, c='blue')
     axes_const[0].set_xlabel('I (In-phase)')
     axes_const[0].set_ylabel('Q (Quadrature)')
     axes_const[0].set_title(ul_const_title)
     axes_const[0].grid(True, alpha=0.3)
     axes_const[0].axis('equal')
     
-    axes_const[1].scatter(dl_const_samples.real, dl_const_samples.imag, alpha=0.3, s=1, c='red')
+    axes_const[1].scatter(dl_samples.real, dl_samples.imag, alpha=0.3, s=1, c='red')
     axes_const[1].set_xlabel('I (In-phase)')
     axes_const[1].set_ylabel('Q (Quadrature)')
     axes_const[1].set_title(dl_const_title)
@@ -2405,20 +2390,11 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
             print(f"Saved magnitude plot: {plot_file_mag}")
             plt.close()
             
-            # Create Constellation plot
-            # For very large datasets, use downsampling for visualization to avoid performance issues
-            # but still show a representative sample
-            if len(samples) > 50000:
-                # Downsample for visualization: take every Nth sample
-                downsample_factor = len(samples) // 50000
-                samples_for_const = samples[::downsample_factor]
-                const_title = f'{title} - Constellation\n(showing {len(samples_for_const):,} of {len(samples):,} samples)'
-            else:
-                samples_for_const = samples
-                const_title = f'{title} - Constellation\n{sample_info}'
+            # Create Constellation plot - plot all samples
+            const_title = f'{title} - Constellation\n{sample_info}'
             
             fig_const, ax_const = plt.subplots(1, 1, figsize=(10, 10))
-            ax_const.scatter(samples_for_const.real, samples_for_const.imag, alpha=0.3, s=1)
+            ax_const.scatter(samples.real, samples.imag, alpha=0.3, s=1)
             ax_const.set_xlabel('I (In-phase)')
             ax_const.set_ylabel('Q (Quadrature)')
             ax_const.set_title(const_title)
