@@ -1,4 +1,8 @@
 pyshark>=0.6
 numpy>=1.20.0
 matplotlib>=3.3.0
+mplcursors
+PyQt6==6.6.1
+PyQt6-Qt6==6.6.1
+PyQt6-sip==13.6.0
 

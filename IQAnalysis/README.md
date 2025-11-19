@@ -19,24 +19,37 @@ Python tool for extracting IQ samples from 5G NR Fronthaul pcap files using the 
 pip install -r requirements.txt
 ```
 
-Requirements: `scapy`, `numpy`, `matplotlib`
+Requirements: `pyshark`, `numpy`, `matplotlib`, `mplcursors`, `PyQt6`
 
 ## Usage
 
-### Basic Command
+### GUI Application (Recommended)
+
+The easiest way to use the tool is via the graphical interface:
 
 ```bash
-python PCAP_Analyzer.py <pcap_file> [output_name]
+python IQ_Analyzer_GUI.py
+```
+
+Drag and drop your PCAP file, configure settings, and click "Run Analysis".
+
+### Command Line Interface
+
+```bash
+python PCAP_Analyzer_WS.py <pcap_file> [options]
 ```
 
 ### Examples
 
 ```bash
 # Analyze a capture file
-python PCAP_Analyzer.py capture.pcap
+python PCAP_Analyzer_WS.py capture.pcap
+
+# Analyze with specific symbol range for plotting
+python PCAP_Analyzer_WS.py capture.pcap --show-plots --start-symbol 20 --symbols 25
 
 # Specify custom output name
-python PCAP_Analyzer.py capture.pcap my_data
+python PCAP_Analyzer_WS.py capture.pcap --output my_data
 ```
 
 ## Output Files

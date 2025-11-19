@@ -3507,6 +3507,9 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False, start_sy
     print()  # Add blank line after all plots
 
 if __name__ == "__main__":
+    # Enable line buffering for stdout to ensure GUI gets updates immediately
+    sys.stdout.reconfigure(line_buffering=True)
+    
     import argparse
     
     # Record start time
@@ -3668,15 +3671,15 @@ if __name__ == "__main__":
     
     print("Done!")
     
+    # Calculate and print execution time
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"\nExecution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
+    
     # Show all plots at once if interactive mode is enabled
     if args.show_plots:
         import matplotlib.pyplot as plt
         print("Displaying all plots...")
         plt.show()
-    
-    # Calculate and print execution time
-    end_time = time.time()
-    execution_time = end_time - start_time
-    print(f"\nExecution time: {execution_time:.2f} seconds ({execution_time/60:.2f} minutes)")
 
 
