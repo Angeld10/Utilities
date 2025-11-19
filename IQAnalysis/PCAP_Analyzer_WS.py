@@ -19,11 +19,17 @@ except ImportError:
     print("Error: pyshark library not found. Please install it with: pip install pyshark")
     sys.exit(1)
 
+try:
+    import mplcursors
+except ImportError:
+    mplcursors = None
+    # Don't exit, just disable interactive cursor features
+
 # Import helper functions from the original script
 # We'll copy the helper functions that don't depend on scapy
 
-FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed'
-FORCE_BFP_BITWIDTH = 16                  # 8-14 for BFP compression
+FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
+FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
@@ -2203,7 +2209,7 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
     
     return mask
 
-def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None):
+def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None, show_plot=False):
     """Create comparison plots for UL vs DL"""
     import matplotlib.pyplot as plt
     import os
@@ -2300,6 +2306,11 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     mag_output_file = output_file.replace('.png', '_magnitude.png')
     plt.savefig(mag_output_file, dpi=200, bbox_inches='tight')
     print(f"Saved magnitude comparison plot: {mag_output_file}")
+    
+    if show_plot:
+        print("Displaying magnitude comparison plot...")
+        plt.show()
+    
     plt.close()
     
     # Create Constellation comparison plot - plot all samples
@@ -2309,6 +2320,7 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     fig_const, axes_const = plt.subplots(1, 2, figsize=(14, 7))
     fig_const.suptitle(f'{title} - Constellation', fontsize=14, fontweight='bold')
     
+    # UL Constellation
     axes_const[0].scatter(ul_samples.real, ul_samples.imag, alpha=0.3, s=1, c='blue')
     axes_const[0].set_xlabel('I (In-phase)')
     axes_const[0].set_ylabel('Q (Quadrature)')
@@ -2316,20 +2328,46 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     axes_const[0].grid(True, alpha=0.3)
     axes_const[0].axis('equal')
     
-    axes_const[1].scatter(dl_samples.real, dl_samples.imag, alpha=0.3, s=1, c='red')
+    # DL Constellation
+    axes_const[1].scatter(dl_unique.real, dl_unique.imag, alpha=0.6, s=5, c='red')
     axes_const[1].set_xlabel('I (In-phase)')
     axes_const[1].set_ylabel('Q (Quadrature)')
     axes_const[1].set_title(dl_const_title)
     axes_const[1].grid(True, alpha=0.3)
     axes_const[1].axis('equal')
     
+    if show_plot and mplcursors:
+        try:
+            cursor = mplcursors.cursor(axes_const[0].collections[0], hover=True)
+            @cursor.connect("add")
+            def on_add(sel):
+                pos = sel.target
+                idx = sel.index
+                count = ul_counts[idx]
+                sel.annotation.set_text(f"I: {pos[0]:.4f}\nQ: {pos[1]:.4f}\nCount: {count}")
+                
+            cursor2 = mplcursors.cursor(axes_const[1].collections[0], hover=True)
+            @cursor2.connect("add")
+            def on_add2(sel):
+                pos = sel.target
+                idx = sel.index
+                count = dl_counts[idx]
+                sel.annotation.set_text(f"I: {pos[0]:.4f}\nQ: {pos[1]:.4f}\nCount: {count}")
+        except Exception as e:
+            print(f"Warning: Could not enable interactive cursor: {e}")
+    
     plt.tight_layout()
     const_output_file = output_file.replace('.png', '_constellation.png')
     plt.savefig(const_output_file, dpi=200, bbox_inches='tight')
     print(f"Saved constellation comparison plot: {const_output_file}\n")
+    
+    if show_plot:
+        print("Displaying constellation comparison plot...")
+        plt.show()
+    
     plt.close()
 
-def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None):
+def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None, show_plot=False):
     """Create individual plots for each eAxC ID"""
     import matplotlib.pyplot as plt
     import os
@@ -2388,22 +2426,48 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
             plot_file_mag = os.path.join(plots_dir, f"{output_base}_eAxC{eaxc_id}_{direction}_magnitude.png")
             plt.savefig(plot_file_mag, dpi=150, bbox_inches='tight')
             print(f"Saved magnitude plot: {plot_file_mag}")
+            
+            if show_plot:
+                print(f"Displaying magnitude plot for eAxC {eaxc_id} {direction}...")
+                plt.show()
+            
             plt.close()
             
-            # Create Constellation plot - plot all samples
+            # Create Constellation plot - plot unique samples without density coloring
             const_title = f'{title} - Constellation\n{sample_info}'
             
+            # Get unique samples and counts for tooltip display
+            unique_vals, counts = np.unique(samples, return_counts=True)
+            
             fig_const, ax_const = plt.subplots(1, 1, figsize=(10, 10))
-            ax_const.scatter(samples.real, samples.imag, alpha=0.3, s=1)
+            ax_const.scatter(unique_vals.real, unique_vals.imag, alpha=0.6, s=5)
             ax_const.set_xlabel('I (In-phase)')
             ax_const.set_ylabel('Q (Quadrature)')
             ax_const.set_title(const_title)
             ax_const.grid(True, alpha=0.3)
             ax_const.axis('equal')
+            
+            if show_plot and mplcursors:
+                try:
+                    cursor = mplcursors.cursor(ax_const.collections[0], hover=True)
+                    @cursor.connect("add")
+                    def on_add(sel):
+                        pos = sel.target
+                        idx = sel.index
+                        count = counts[idx]
+                        sel.annotation.set_text(f"I: {pos[0]:.4f}\nQ: {pos[1]:.4f}\nCount: {count}")
+                except Exception as e:
+                    print(f"Warning: Could not enable interactive cursor: {e}")
+            
             plt.tight_layout()
             plot_file_const = os.path.join(plots_dir, f"{output_base}_eAxC{eaxc_id}_{direction}_constellation.png")
             plt.savefig(plot_file_const, dpi=150, bbox_inches='tight')
             print(f"Saved constellation plot: {plot_file_const}")
+            
+            if show_plot:
+                print(f"Displaying constellation plot for eAxC {eaxc_id} {direction}...")
+                plt.show()
+            
             plt.close()
     
     print()
@@ -3035,7 +3099,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     
     return analysis_data
 
-def plot_resource_allocation(analysis_data, pcap_file):
+def plot_resource_allocation(analysis_data, pcap_file, show_plot=False):
     """Create separate resource allocation plots for each eAxC ID showing symbols vs Resource Blocks (RBs)"""
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
@@ -3267,6 +3331,11 @@ def plot_resource_allocation(analysis_data, pcap_file):
         output_file = os.path.join(plots_dir, f'{base_name}_eAxC{eaxc_id}_resource_allocation.png')
         plt.savefig(output_file, dpi=200, bbox_inches='tight')
         print(f"Saved resource allocation plot for eAxC {eaxc_id}: {output_file}")
+        
+        if show_plot:
+            print(f"Displaying resource allocation plot for eAxC {eaxc_id}...")
+            plt.show()
+        
         plt.close()
     
     print()  # Add blank line after all plots
@@ -3297,6 +3366,8 @@ if __name__ == "__main__":
                        help='BFP exponent value (0-15)')
     parser.add_argument('--no-parallel', action='store_true',
                        help='Disable parallel processing (process packets sequentially)')
+    parser.add_argument('--show-plots', action='store_true',
+                       help='Show plots in interactive windows instead of just saving them')
     
     args = parser.parse_args()
     
@@ -3348,7 +3419,7 @@ if __name__ == "__main__":
     
     # Create resource allocation plot
     if analysis_data['packet_count'] > 0:
-        plot_resource_allocation(analysis_data, args.pcap_file)
+        plot_resource_allocation(analysis_data, args.pcap_file, show_plot=args.show_plots)
     
     # Create Plots directory in workspace root
     workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
@@ -3416,12 +3487,14 @@ if __name__ == "__main__":
     # Create comparison plot
     print("Creating comparison plot...")
     plot_comparison(iq_data, f"{args.output_base}_UL_vs_DL.png", max_samples=max_samples, 
-                    start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir)
+                    start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir,
+                    show_plot=args.show_plots)
     
     # Create individual plots for each eAxC/direction
     print("Creating individual plots...")
     plot_all_eaxc(iq_data, args.output_base, max_samples=max_samples, 
-                  start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir)
+                  start_symbol=start_symbol, end_symbol=end_symbol, plots_dir=plots_dir,
+                  show_plot=args.show_plots)
     
     print("Done!")
     

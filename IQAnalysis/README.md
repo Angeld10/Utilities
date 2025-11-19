@@ -244,6 +244,7 @@ for sym in range(14):
 ## Troubleshooting
 
 **No IQ data found:**
+- Verify you are configuring the right compression method and bitwidth at the top of the file
 - Verify eCPRI packets exist with: `tshark -r file.pcap -Y "vlan.etype == 0xaefe"`
 - Check that message type is 0x00 (IQ data)
 
@@ -256,7 +257,6 @@ for sym in range(14):
 - For other formats, modify the `struct.unpack()` calls in the script
 
 **Large files:**
-- Plots automatically limit to 2000-5000 samples
 - Use NumPy memory mapping for very large files: `np.load('file.npy', mmap_mode='r')`
 
 ## Technical References
