@@ -28,8 +28,8 @@ except ImportError:
 # Import helper functions from the original script
 # We'll copy the helper functions that don't depend on scapy
 
-FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
-FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
+FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed'
+FORCE_BFP_BITWIDTH = 16                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
@@ -3255,10 +3255,13 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False):
         # Create distinct colors for each RB using a colormap
         if max_rbs <= 20:
             base_colors = plt.cm.tab20(np.linspace(0, 1, 20))
-        elif max_rbs <= 50:
-            base_colors = plt.cm.Set3(np.linspace(0, 1, 12))
         else:
-            base_colors = plt.cm.hsv(np.linspace(0, 1, max_rbs))
+            # Use hsv but shuffle to ensure high contrast between adjacent indices
+            # This makes boundaries much easier to distinguish
+            palette = plt.cm.hsv(np.linspace(0, 0.9, max_rbs))  # 0.9 to avoid wrapping back to red
+            np.random.seed(42) # For reproducibility
+            np.random.shuffle(palette)
+            base_colors = palette
         
         # Create color list: unallocated (index 0) + distinct colors for each RB
         colors = [unallocated_color]
