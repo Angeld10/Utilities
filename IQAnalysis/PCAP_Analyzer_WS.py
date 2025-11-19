@@ -26,10 +26,9 @@ except ImportError:
     # Don't exit, just disable interactive cursor features
 
 # Import helper functions from the original script
-# We'll copy the helper functions that don't depend on scapy
 
-FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed'
-FORCE_BFP_BITWIDTH = 16                  # 8-14 for BFP compression
+FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
+FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
 NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
 ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 
@@ -350,12 +349,13 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
     use_uncompressed = (config_compression_type == 'uncompressed')
     
     if use_bfp:
-        if FORCE_BFP_BITWIDTH is None:
-            raise ValueError("FORCE_BFP_BITWIDTH must be set")
-        if FORCE_BFP_BITWIDTH < 8 or FORCE_BFP_BITWIDTH > 14:
-            raise ValueError(f"Invalid FORCE_BFP_BITWIDTH: {FORCE_BFP_BITWIDTH}")
+        bfp_bits = bfp_bitwidth if bfp_bitwidth is not None else FORCE_BFP_BITWIDTH
         
-        bfp_bits = FORCE_BFP_BITWIDTH
+        if bfp_bits is None:
+            raise ValueError("FORCE_BFP_BITWIDTH must be set")
+        if bfp_bits < 8 or bfp_bits > 14:
+            raise ValueError(f"Invalid BFP bitwidth: {bfp_bits}")
+
         samples_per_rb = 12
         # max_rbs is now passed as parameter (dynamically determined from ORAN section tree)
         
@@ -1071,7 +1071,7 @@ def _process_packet_batch(args):
                 iq_offset = 8
                 samples, compression_type, num_samples, exponents_list = parse_iq_samples_func(
                     oran_data, iq_offset, 0, 0,
-                    force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
+                    force_bfp=force_bfp, bfp_exponent=bfp_exponent, bfp_bitwidth=FORCE_BFP_BITWIDTH, max_rbs=current_max_rbs)
                 # Detect compression warnings after parsing
                 if samples and len(samples) > 0:
                     try:
@@ -1184,7 +1184,7 @@ def _process_packet_batch(args):
     
     return batch_results
 
-def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False, use_parallel=True):
+def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, bfp_bitwidth=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False, use_parallel=True):
     """Extract IQ samples with direction and eAxC ID information using pyshark.
     Also collects analysis statistics for reporting.
     
@@ -1242,9 +1242,13 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
         # Set compression method preference for ORAN FH CUS
         # Use string values as specified in TShark preferences (case-insensitive)
         # Valid values: "COMP_NONE", "COMP_BLOCK_FP", "No Compression", "Block Floating Point Compression", etc.
-        if FORCE_COMPRESSION_TYPE.upper() == 'BFP':
+        # Use arguments if provided, otherwise fall back to globals
+        use_bfp = force_bfp if force_bfp else (FORCE_COMPRESSION_TYPE.upper() == 'BFP')
+        bitwidth = bfp_bitwidth if bfp_bitwidth is not None else FORCE_BFP_BITWIDTH
+        
+        if use_bfp:
             compression_pref = 'COMP_BLOCK_FP'  # or 'Block Floating Point Compression'
-            iq_bitwidth = str(FORCE_BFP_BITWIDTH)
+            iq_bitwidth = str(bitwidth)
         else:
             compression_pref = 'COMP_NONE'  # or 'No Compression'
             iq_bitwidth = '16'
@@ -1383,6 +1387,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
         'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
         'max_num_prbc': 0,  # Maximum declared PRBs (from num_prbc field)
         'max_rb_index_with_data': 0,  # Maximum RB index that actually has IQ data
+        'min_overall_symbol': None,  # Minimum overall symbol seen
         'compression_warnings': []  # Store compression detection warnings
     }
     
@@ -1475,12 +1480,24 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                             (slot_id * SYMBOLS_PER_SLOT) + \
                             start_symbol_id
             
-            # Filter by overall symbol number if specified (must happen BEFORE incrementing packet_count)
+            # Track first overall symbol seen (base for relative count)
+            # Only set if we have valid timing info (frame_id is present in fields)
+            if 'first_overall_symbol' not in analysis_data and 'frame_id' in fields:
+                analysis_data['first_overall_symbol'] = overall_symbol
+            
+            # Calculate relative symbol
+            if 'first_overall_symbol' in analysis_data:
+                relative_symbol = overall_symbol - analysis_data['first_overall_symbol']
+            else:
+                # If we haven't found a valid start packet yet, we can't calculate relative symbol correctly
+                # For filtering purposes, we can treat it as 0 or skip filtering
+                relative_symbol = 0
+            
+            # Filter by relative symbol number if specified (must happen BEFORE incrementing packet_count)
             if start_symbol is not None or end_symbol is not None:
-                # Check overall symbol range first
-                if start_symbol is not None and overall_symbol < start_symbol:
+                if start_symbol is not None and relative_symbol < start_symbol:
                     continue
-                if end_symbol is not None and overall_symbol > end_symbol:
+                if end_symbol is not None and relative_symbol > end_symbol:
                     continue
                 
                 # Only restrict to first frame/subframe/slot when using --symbols (not --start-symbol/--end-symbol)
@@ -1649,6 +1666,10 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                 }
             }
             
+            # Update min_overall_symbol
+            if analysis_data['min_overall_symbol'] is None or overall_symbol < analysis_data['min_overall_symbol']:
+                analysis_data['min_overall_symbol'] = overall_symbol
+            
             # Get packet timestamp
             try:
                 if hasattr(packet, 'sniff_timestamp'):
@@ -1684,8 +1705,11 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
         batch_results_list = []
         
         # Prepare batch arguments
+        effective_compression = 'BFP' if use_bfp else 'uncompressed'
+        effective_bitwidth = bitwidth
+        
         batch_args = [
-            (batch, force_bfp, bfp_exponent, FORCE_COMPRESSION_TYPE, FORCE_BFP_BITWIDTH, ENDIAN)
+            (batch, force_bfp, bfp_exponent, effective_compression, effective_bitwidth, ENDIAN)
             for batch in packet_batches
         ]
         
@@ -1760,6 +1784,19 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                                 (slot_id * SYMBOLS_PER_SLOT) + \
                                 start_symbol_id
                 
+                # Calculate relative symbol (relative to first symbol seen)
+                first_overall_symbol = analysis_data.get('first_overall_symbol')
+                if first_overall_symbol is None:
+                    # Only set if we have valid timing info (frame_id is present in fields)
+                    if 'frame_id' in fields:
+                        first_overall_symbol = overall_symbol
+                        analysis_data['first_overall_symbol'] = first_overall_symbol
+                
+                if first_overall_symbol is not None:
+                    relative_symbol = overall_symbol - first_overall_symbol
+                else:
+                    relative_symbol = 0
+                
                 # Store samples
                 if len(samples) > 0:
                     iq_data[eaxc_id][direction].extend(samples)
@@ -1793,6 +1830,8 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                     'subframe_id': subframe_id,
                     'slot_id': slot_id,
                     'start_symbol_id': start_symbol_id,
+                    'overall_symbol': overall_symbol,
+                    'relative_symbol': relative_symbol,
                     'num_symbols': num_symbols,
                     'start_prbc': start_prbc,
                     'num_prbc': num_prbc,
@@ -1965,18 +2004,28 @@ def print_analysis_report(analysis_data, total_packets, start_symbol=None, end_s
         # When filtering by overall symbol, show overall symbols
         if analysis_data['overall_symbol_counts']:
             overall_symbol_list = sorted(analysis_data['overall_symbol_counts'].keys())
-            print(f"  Overall Symbol Numbers: {min(overall_symbol_list)} to {max(overall_symbol_list)} ({len(overall_symbol_list)} unique overall symbols)")
-            print(f"  Packets per overall symbol:")
+            first_overall_symbol = analysis_data.get('first_overall_symbol')
+            if first_overall_symbol is None:
+                first_overall_symbol = min(overall_symbol_list) if overall_symbol_list else 0
+            
+            # Calculate relative symbol range
+            min_relative = min(overall_symbol_list) - first_overall_symbol if overall_symbol_list else 0
+            max_relative = max(overall_symbol_list) - first_overall_symbol if overall_symbol_list else 0
+            
+            print(f"  Relative Symbol Numbers: {min_relative} to {max_relative} ({len(overall_symbol_list)} unique symbols)")
+            print(f"  (Absolute: {min(overall_symbol_list)} to {max(overall_symbol_list)})")
+            print(f"  Packets per relative symbol:")
             for overall_sym in overall_symbol_list:
+                relative_sym = overall_sym - first_overall_symbol
                 total_count = analysis_data['overall_symbol_counts'][overall_sym]
                 unique_combos = len(analysis_data['overall_symbol_unique_combos'][overall_sym])
                 eaxc_breakdown = analysis_data['overall_symbol_eaxc_counts'][overall_sym]
                 
-                print(f"    Overall Symbol {overall_sym:2d}: {total_count:4d} packets ({unique_combos} unique frame/subframe/slot/symbol/eAxC combos)")
+                print(f"    Relative Symbol {relative_sym:3d} (Abs: {overall_sym}): {total_count:4d} packets ({unique_combos} unique frame/subframe/slot/symbol/eAxC combos)")
                 
                 # Show the actual unique combinations to understand why there are multiple
                 if unique_combos > 1 and unique_combos <= 20:  # Only show if reasonable number
-                    print(f"      Unique combos for overall symbol {overall_sym}:")
+                    print(f"      Unique combos for relative symbol {relative_sym}:")
                     for combo in sorted(analysis_data['overall_symbol_unique_combos'][overall_sym]):
                         frame_id, subframe_id, slot_id, symbol_id, eaxc_id = combo
                         print(f"        Frame {frame_id}, Subframe {subframe_id}, Slot {slot_id}, Symbol {symbol_id}, eAxC {eaxc_id}")
@@ -2194,15 +2243,34 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
     if end_symbol is None:
         end_symbol = 63  # Maximum symbol ID in 5G NR
     
-    # Build mask by checking each packet's symbol
+    # Build mask by checking each packet's relative overall symbol
     current_sample_index = 0
     
     for m in metadata:
-        symbol_id = m['symbol_id']
+        relative_symbol = m.get('relative_symbol')
+        if relative_symbol is None:
+            # Fallback: calculate relative symbol from metadata fields if not stored
+            frame_id = m.get('frame_id', 0)
+            subframe_id = m.get('subframe_id', 0)
+            slot_id = m.get('slot_id', 0)
+            start_symbol_id = m.get('start_symbol_id', 0)
+            SYMBOLS_PER_SLOT = 14
+            SUBFRAMES_PER_FRAME = 10
+            SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
+            overall_symbol = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                            (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                            (slot_id * SYMBOLS_PER_SLOT) + \
+                            start_symbol_id
+            # We don't have first_overall_symbol here, so skip filtering (return all True)
+            # This shouldn't happen if metadata is created correctly
+            mask[current_sample_index:current_sample_index + m['num_samples']] = True
+            current_sample_index += m['num_samples']
+            continue
+        
         num_samples = m['num_samples']
         
-        # Check if this symbol is in our range
-        if start_symbol <= symbol_id <= end_symbol:
+        # Check if this relative symbol is in our range
+        if start_symbol <= relative_symbol <= end_symbol:
             mask[current_sample_index:current_sample_index + num_samples] = True
         
         current_sample_index += num_samples
@@ -2552,9 +2620,13 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
         # Set compression method preference for ORAN FH CUS
         # Use string values as specified in TShark preferences (case-insensitive)
         # Valid values: "COMP_NONE", "COMP_BLOCK_FP", "No Compression", "Block Floating Point Compression", etc.
-        if FORCE_COMPRESSION_TYPE.upper() == 'BFP':
+        # Use arguments if provided, otherwise fall back to globals
+        use_bfp = force_bfp if force_bfp else (FORCE_COMPRESSION_TYPE.upper() == 'BFP')
+        bitwidth = bfp_bitwidth if bfp_bitwidth is not None else FORCE_BFP_BITWIDTH
+        
+        if use_bfp:
             compression_pref = 'COMP_BLOCK_FP'  # or 'Block Floating Point Compression'
-            iq_bitwidth = str(FORCE_BFP_BITWIDTH)
+            iq_bitwidth = str(bitwidth)
         else:
             compression_pref = 'COMP_NONE'  # or 'No Compression'
             iq_bitwidth = '16'
@@ -2767,12 +2839,24 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
                             (slot_id * SYMBOLS_PER_SLOT) + \
                             start_symbol_id
             
-            # Filter by overall symbol number if specified (must happen BEFORE incrementing packet_count)
+            # Track minimum overall symbol seen (for analyze_pcap entry point)
+            if 'first_overall_symbol' not in analysis_data:
+                analysis_data['first_overall_symbol'] = overall_symbol
+            
+            # Also track min for compatibility
+            if 'min_overall_symbol' not in analysis_data:
+                analysis_data['min_overall_symbol'] = overall_symbol
+            elif overall_symbol < analysis_data['min_overall_symbol']:
+                analysis_data['min_overall_symbol'] = overall_symbol
+            
+            # Calculate relative symbol
+            relative_symbol = overall_symbol - analysis_data['first_overall_symbol']
+            
+            # Filter by relative symbol number if specified (must happen BEFORE incrementing packet_count)
             if start_symbol is not None or end_symbol is not None:
-                # Check overall symbol range first
-                if start_symbol is not None and overall_symbol < start_symbol:
+                if start_symbol is not None and relative_symbol < start_symbol:
                     continue
-                if end_symbol is not None and overall_symbol > end_symbol:
+                if end_symbol is not None and relative_symbol > end_symbol:
                     continue
                 
                 # Only restrict to first frame/subframe/slot when using --symbols (not --start-symbol/--end-symbol)
@@ -3029,18 +3113,28 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
         # When filtering by overall symbol, show overall symbols
         if analysis_data['overall_symbol_counts']:
             overall_symbol_list = sorted(analysis_data['overall_symbol_counts'].keys())
-            print(f"  Overall Symbol Numbers: {min(overall_symbol_list)} to {max(overall_symbol_list)} ({len(overall_symbol_list)} unique overall symbols)")
-            print(f"  Packets per overall symbol:")
+            first_overall_symbol = analysis_data.get('first_overall_symbol')
+            if first_overall_symbol is None:
+                first_overall_symbol = min(overall_symbol_list) if overall_symbol_list else 0
+            
+            # Calculate relative symbol range
+            min_relative = min(overall_symbol_list) - first_overall_symbol if overall_symbol_list else 0
+            max_relative = max(overall_symbol_list) - first_overall_symbol if overall_symbol_list else 0
+            
+            print(f"  Relative Symbol Numbers: {min_relative} to {max_relative} ({len(overall_symbol_list)} unique symbols)")
+            print(f"  (Absolute: {min(overall_symbol_list)} to {max(overall_symbol_list)})")
+            print(f"  Packets per relative symbol:")
             for overall_sym in overall_symbol_list:
+                relative_sym = overall_sym - first_overall_symbol
                 total_count = analysis_data['overall_symbol_counts'][overall_sym]
                 unique_combos = len(analysis_data['overall_symbol_unique_combos'][overall_sym])
                 eaxc_breakdown = analysis_data['overall_symbol_eaxc_counts'][overall_sym]
                 
-                print(f"    Overall Symbol {overall_sym:2d}: {total_count:4d} packets ({unique_combos} unique frame/subframe/slot/symbol/eAxC combos)")
+                print(f"    Relative Symbol {relative_sym:3d} (Abs: {overall_sym}): {total_count:4d} packets ({unique_combos} unique frame/subframe/slot/symbol/eAxC combos)")
                 
                 # Show the actual unique combinations to understand why there are multiple
                 if unique_combos > 1 and unique_combos <= 20:  # Only show if reasonable number
-                    print(f"      Unique combos for overall symbol {overall_sym}:")
+                    print(f"      Unique combos for relative symbol {relative_sym}:")
                     for combo in sorted(analysis_data['overall_symbol_unique_combos'][overall_sym]):
                         frame_id, subframe_id, slot_id, symbol_id, eaxc_id = combo
                         print(f"        Frame {frame_id}, Subframe {subframe_id}, Slot {slot_id}, Symbol {symbol_id}, eAxC {eaxc_id}")
@@ -3099,7 +3193,7 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     
     return analysis_data
 
-def plot_resource_allocation(analysis_data, pcap_file, show_plot=False):
+def plot_resource_allocation(analysis_data, pcap_file, show_plot=False, start_symbol=None, end_symbol=None):
     """Create separate resource allocation plots for each eAxC ID showing symbols vs Resource Blocks (RBs)"""
     import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
@@ -3192,6 +3286,29 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False):
             frame_id, subframe_id, slot_id = slot_key
             # Include all 14 symbols (0-13) for this slot, even if they don't have data
             for symbol_id in range(SYMBOLS_PER_SLOT_PLOT):
+                # Check if this symbol is within the requested range
+                # Calculate overall symbol number
+                SUBFRAMES_PER_FRAME = 10
+                SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
+                SYMBOLS_PER_SLOT = 14
+                
+                overall_sym = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                              (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                              (slot_id * SYMBOLS_PER_SLOT) + \
+                              symbol_id
+                
+                first_overall_symbol = analysis_data.get('first_overall_symbol')
+                if first_overall_symbol is not None:
+                    relative_sym = overall_sym - first_overall_symbol
+                else:
+                    relative_sym = 0 # Should not happen if data exists
+                
+                # Filter based on start_symbol and end_symbol (relative)
+                if start_symbol is not None and relative_sym < start_symbol:
+                    continue
+                if end_symbol is not None and relative_sym > end_symbol:
+                    continue
+                
                 combo = (frame_id, subframe_id, slot_id, symbol_id)
                 unique_combinations.append(combo)
                 # If this combo doesn't have data, create an empty entry (will show as unallocated)
@@ -3353,7 +3470,25 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False):
                             combo = unique_combinations[col_idx]
                             if len(combo) == 4:
                                 f, sf, sl, sym = combo
-                                timing_str = f"Frame: {f}\nSubframe: {sf}\nSlot: {sl}\nSymbol: {sym}"
+                                
+                                # Calculate overall symbol number
+                                # Replicate logic from analyze_pcap
+                                SYMBOLS_PER_SLOT = 14
+                                SUBFRAMES_PER_FRAME = 10
+                                SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
+                                
+                                overall_sym = (f * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                                              (sf * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                                              (sl * SYMBOLS_PER_SLOT) + \
+                                              sym
+                                
+                                # Use first_overall_symbol for relative calc
+                                first_overall_symbol = analysis_data.get('first_overall_symbol')
+                                if first_overall_symbol is not None:
+                                    relative_overall_sym = overall_sym - first_overall_symbol
+                                    timing_str = f"Frame: {f}\nSubframe: {sf}\nSlot: {sl}\nSymbol: {sym}\nRelative Symbol: {relative_overall_sym}\n(Absolute: {overall_sym})"
+                                else:
+                                    timing_str = f"Frame: {f}\nSubframe: {sf}\nSlot: {sl}\nSymbol: {sym}\nOverall Symbol: {overall_sym}"
                             else:
                                 f, sl, sym = combo
                                 timing_str = f"Frame: {f}\nSlot: {sl}\nSymbol: {sym}"
@@ -3395,6 +3530,8 @@ if __name__ == "__main__":
                        help='Force BFP decompression')
     parser.add_argument('--bfp-exponent', type=int, metavar='N',
                        help='BFP exponent value (0-15)')
+    parser.add_argument('--bfp-bitwidth', type=int, default=9, metavar='N',
+                       help='BFP bitwidth (8-14) for forced decompression (default: 9)')
     parser.add_argument('--no-parallel', action='store_true',
                        help='Disable parallel processing (process packets sequentially)')
     parser.add_argument('--show-plots', action='store_true',
@@ -3431,12 +3568,14 @@ if __name__ == "__main__":
     
     # When --symbols is used, restrict to first frame/subframe/slot
     # When --start-symbol/--end-symbol is used directly, allow any frame/subframe/slot
-    restrict_to_first = (args.symbols is not None and args.symbols > 0)
+    # restrict_to_first = (args.symbols is not None and args.symbols > 0)
+    # Disable restriction to first combo to allow symbols to span across slots
+    restrict_to_first = False
     
     # Extract IQ samples with metadata (also collects analysis data in a single pass)
     use_parallel = not args.no_parallel  # Default to parallel, disable if --no-parallel is set
     iq_data, analysis_data, total_packets = extract_iq_with_metadata(
-        args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent,
+        args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent, bfp_bitwidth=args.bfp_bitwidth,
         start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first,
         use_parallel=use_parallel)
     
@@ -3450,7 +3589,7 @@ if __name__ == "__main__":
     
     # Create resource allocation plot
     if analysis_data['packet_count'] > 0:
-        plot_resource_allocation(analysis_data, args.pcap_file, show_plot=args.show_plots)
+        plot_resource_allocation(analysis_data, args.pcap_file, show_plot=args.show_plots, start_symbol=start_symbol, end_symbol=end_symbol)
     
     # Create Plots directory in workspace root
     workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
