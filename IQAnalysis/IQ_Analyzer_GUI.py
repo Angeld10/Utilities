@@ -170,15 +170,10 @@ class MainWindow(QMainWindow):
         self.txt_console.setReadOnly(True)
         self.tabs.addTab(self.txt_console, "Console")
         
-        self.txt_stats = QTextEdit()
-        self.txt_stats.setReadOnly(True)
-        self.txt_stats.setFont(QFont("Courier New", 9))
-        self.tabs.addTab(self.txt_stats, "Stats")
-        
-        self.txt_metadata = QTextEdit()
-        self.txt_metadata.setReadOnly(True)
-        self.txt_metadata.setFont(QFont("Courier New", 9))
-        self.tabs.addTab(self.txt_metadata, "Metadata")
+        self.txt_report = QTextEdit()
+        self.txt_report.setReadOnly(True)
+        self.txt_report.setFont(QFont("Courier New", 9))
+        self.tabs.addTab(self.txt_report, "Report")
         
         main_layout.addWidget(self.tabs)
 
@@ -203,8 +198,7 @@ class MainWindow(QMainWindow):
 
         # Clear previous output
         self.txt_console.clear()
-        self.txt_stats.clear()
-        self.txt_metadata.clear()
+        self.txt_report.clear()
         self.current_output_section = "Console"
         self.tabs.setCurrentIndex(0)
 
@@ -257,13 +251,17 @@ class MainWindow(QMainWindow):
             self.current_output_section = "Stats"
         elif "FRAME INFORMATION:" in clean_line:
             self.current_output_section = "Metadata"
+        elif "Detected maximum" in clean_line:
+            # This is the last line of the report, capture it then stop
+            if self.current_output_section in ["Stats", "Metadata"]:
+                self.txt_report.insertPlainText(line)
+                self.txt_report.moveCursor(self.txt_report.textCursor().MoveOperation.End)
+            self.current_output_section = "Console"  # Switch back to console only
+            return  # Don't process further
             
-        if self.current_output_section == "Stats":
-            self.txt_stats.insertPlainText(line)
-            self.txt_stats.moveCursor(self.txt_stats.textCursor().MoveOperation.End)
-        elif self.current_output_section == "Metadata":
-            self.txt_metadata.insertPlainText(line)
-            self.txt_metadata.moveCursor(self.txt_metadata.textCursor().MoveOperation.End)
+        if self.current_output_section in ["Stats", "Metadata"]:
+            self.txt_report.insertPlainText(line)
+            self.txt_report.moveCursor(self.txt_report.textCursor().MoveOperation.End)
 
     def analysis_finished(self):
         self.btn_run.setEnabled(True)
