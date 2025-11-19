@@ -30,6 +30,9 @@ ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
 #Debug loop count
 debug_count = 0
 
+# Global list to collect compression warnings
+_compression_warnings = []
+
 def calculate_max_iq(samples):
     """
     Calculate maximum uncompressed I/Q values from a list of complex samples.
@@ -65,6 +68,128 @@ def calculate_dbfs(max_iq, full_scale=32767.0):
     if max_iq <= 0:
         return None
     return 20 * math.log10(max_iq / full_scale)
+
+def detect_wrong_compression_settings(iq_data_bytes, samples, compression_type, configured_compression='uncompressed', configured_bitwidth=16):
+    """
+    Detect if wrong compression settings are being used by checking various heuristics.
+    Similar to Wireshark's malformed packet detection.
+    
+    Args:
+        iq_data_bytes: Raw IQ data bytes
+        samples: Parsed IQ samples (list of complex)
+        compression_type: Compression type string (e.g., 'uncompressed', 'BFP_9bit')
+        configured_compression: What compression was configured ('uncompressed' or 'bfp')
+        configured_bitwidth: Configured bitwidth (for BFP: 8-14, for uncompressed: 16)
+    
+    Returns:
+        tuple: (is_wrong, confidence, warning_messages)
+            is_wrong: Boolean indicating if wrong settings detected
+            confidence: Float 0.0-1.0 indicating confidence level
+            warning_messages: List of warning messages
+    """
+    warnings = []
+    confidence = 0.0
+    
+    if not samples or len(iq_data_bytes) == 0:
+        return False, 0.0, []
+    
+    samples_array = np.array(samples, dtype=complex)
+    
+    # Heuristic 1: Check for extreme values clustering (±32768, ±32767)
+    # If uncompressed data is actually BFP compressed, we'll see many samples at these extremes
+    i_real = samples_array.real
+    q_imag = samples_array.imag
+    
+    # Count samples at extreme values
+    extreme_values = [-32768, -32767, 32767, 32768]
+    extreme_count_i = sum(np.sum(i_real == val) for val in extreme_values)
+    extreme_count_q = sum(np.sum(q_imag == val) for val in extreme_values)
+    extreme_count_total = extreme_count_i + extreme_count_q
+    
+    total_samples = len(samples) * 2  # I and Q components
+    extreme_percentage = (extreme_count_total / total_samples) * 100 if total_samples > 0 else 0
+    
+    # If more than 1% of samples are at extremes, that's suspicious for uncompressed data
+    if configured_compression == 'uncompressed' and extreme_percentage > 1.0:
+        confidence += 0.4
+        warnings.append(f"Suspicious: {extreme_percentage:.2f}% of samples at extreme values (±32767, ±32768)")
+        warnings.append(f"  Found {extreme_count_i} extreme I values and {extreme_count_q} extreme Q values")
+    
+    # Heuristic 2: Check if data size aligns properly
+    if configured_compression == 'uncompressed':
+        # Uncompressed: should be divisible by 4 (2 bytes I + 2 bytes Q per sample)
+        if len(iq_data_bytes) % 4 != 0:
+            confidence += 0.2
+            warnings.append(f"Data size {len(iq_data_bytes)} bytes is not divisible by 4 (uncompressed should be)")
+        else:
+            # Check if the actual number of samples matches expected
+            expected_samples = len(iq_data_bytes) // 4
+            if abs(len(samples) - expected_samples) > expected_samples * 0.01:  # Allow 1% tolerance
+                confidence += 0.2
+                warnings.append(f"Sample count mismatch: expected {expected_samples}, got {len(samples)}")
+    elif configured_compression == 'bfp':
+        # BFP: Check if first bytes look like exponent bytes (0-15 range)
+        if len(iq_data_bytes) > 0:
+            first_bytes = iq_data_bytes[:min(20, len(iq_data_bytes))]
+            exponent_like_bytes = sum(1 for b in first_bytes if 0 <= b <= 15)
+            if exponent_like_bytes >= len(first_bytes) * 0.5:  # More than 50% look like exponents
+                confidence += 0.3
+                warnings.append(f"First {len(first_bytes)} bytes mostly in 0-15 range (looks like BFP exponents)")
+    
+    # Heuristic 3: Check for -32768 specifically (minimum signed int16)
+    # This is a strong indicator of byte misalignment when reading BFP as uncompressed
+    count_min32768_i = np.sum(i_real == -32768)
+    count_min32768_q = np.sum(q_imag == -32768)
+    
+    if configured_compression == 'uncompressed' and (count_min32768_i > 0 or count_min32768_q > 0):
+        total_min32768 = count_min32768_i + count_min32768_q
+        if total_min32768 > 10:  # More than 10 occurrences is suspicious
+            confidence += 0.4
+            warnings.append(f"Found {total_min32768} samples with value -32768 (minimum int16)")
+            warnings.append("  This suggests byte misalignment - BFP data may be read as uncompressed")
+    
+    # Heuristic 4: Check distribution - valid uncompressed IQ should have reasonable distribution
+    # If most values are clustered at extremes, that's suspicious
+    if configured_compression == 'uncompressed' and len(samples) > 100:
+        # Check if values are distributed across the range
+        i_abs = np.abs(i_real)
+        q_abs = np.abs(q_imag)
+        
+        # Check what percentage of values are in the upper 10% of range
+        range_90_100 = np.sum(i_abs > 29490) + np.sum(q_abs > 29490)  # Upper 10% of 32767
+        range_90_100_pct = (range_90_100 / total_samples) * 100
+        
+        if range_90_100_pct > 10:  # More than 10% in top 10% is unusual
+            confidence += 0.2
+            warnings.append(f"Unusual distribution: {range_90_100_pct:.2f}% of samples in upper 10% of range")
+    
+    # Heuristic 5: Try to detect BFP structure if configured as uncompressed
+    if configured_compression == 'uncompressed' and len(iq_data_bytes) > 20:
+        # Check if data structure matches BFP (exponent bytes followed by compressed data)
+        # For BFP9: bytes per RB = 1 (exponent) + (12 samples * 2.25 bytes) = 28 bytes
+        # Check if we can find a pattern that looks like BFP9
+        possible_bfp9_rbs = 0
+        bytes_per_rb_bfp9 = 28  # 1 exponent + 27 bytes for 12 samples at 9 bits
+        
+        for start in range(0, min(100, len(iq_data_bytes) - bytes_per_rb_bfp9), bytes_per_rb_bfp9):
+            exp_byte = iq_data_bytes[start]
+            if 0 <= exp_byte <= 15:
+                possible_bfp9_rbs += 1
+        
+        if possible_bfp9_rbs >= 3:
+            confidence += 0.3
+            warnings.append(f"Detected possible BFP9 structure: {possible_bfp9_rbs} potential exponent bytes found")
+            warnings.append("  Data may be BFP9 compressed but read as uncompressed")
+    
+    # Determine if wrong settings detected
+    is_wrong = confidence >= 0.5  # At least 50% confidence threshold
+    
+    if is_wrong:
+        warnings.insert(0, f"WARNING: Possible wrong compression settings detected (confidence: {confidence:.1%})")
+        warnings.append(f"  Configured: {configured_compression} (bitwidth={configured_bitwidth})")
+        warnings.append("  Recommendation: Try different compression settings")
+    
+    return is_wrong, min(confidence, 1.0), warnings
 
 def decompress_bfp(iq_data_bytes, exponent, bits_per_sample=8):
     """
@@ -323,6 +448,20 @@ def parse_iq_samples(ecpri_data, iq_offset, payload_version, filter_index, force
         iq_reshaped = iq_array.reshape(num_samples, 2)
         # Create complex array
         samples = (iq_reshaped[:, 0] + 1j * iq_reshaped[:, 1]).tolist()
+        
+        # Detect if wrong compression settings are being used
+        # Collect warnings for summary at end instead of printing immediately
+        is_wrong, confidence, warnings = detect_wrong_compression_settings(
+            iq_data_bytes[:num_samples*4], samples, compression_type, 
+            configured_compression=FORCE_COMPRESSION_TYPE.lower(),
+            configured_bitwidth=FORCE_BFP_BITWIDTH
+        )
+        # Store warnings globally for summary at end
+        if is_wrong and warnings:
+            # Only store if we don't already have similar warnings (avoid duplicates)
+            warning_key = (confidence, warnings[0] if warnings else '')
+            if not any(w.get('key') == warning_key for w in _compression_warnings):
+                _compression_warnings.append({'confidence': confidence, 'warnings': warnings, 'key': warning_key})
     
     return samples, compression_type, num_samples, exponents_list
 
@@ -442,6 +581,20 @@ def parse_iq_from_prb_raw(prb_raw, compression_method, compression_width, max_rb
             iq_array = np.frombuffer(iq_data_bytes[:num_samples*4], dtype='>i2')
             iq_reshaped = iq_array.reshape(num_samples, 2)
             samples = (iq_reshaped[:, 0] + 1j * iq_reshaped[:, 1]).tolist()
+            
+            # Detect if wrong compression settings are being used
+            # Collect warnings for summary at end instead of printing immediately
+            is_wrong, confidence, warnings = detect_wrong_compression_settings(
+                iq_data_bytes[:num_samples*4], samples, compression_type,
+                configured_compression='uncompressed' if compression_method == 0 else 'bfp',
+                configured_bitwidth=compression_width
+            )
+            # Store warnings globally for summary at end
+            if is_wrong and warnings:
+                # Only store if we don't already have similar warnings (avoid duplicates)
+                warning_key = (confidence, warnings[0] if warnings else '')
+                if not any(w.get('key') == warning_key for w in _compression_warnings):
+                    _compression_warnings.append({'confidence': confidence, 'warnings': warnings, 'key': warning_key})
     
     return samples, compression_type, len(samples), exponents_list
 
@@ -850,7 +1003,8 @@ def _process_packet_batch(args):
     batch_results = {
         'packet_results': [],
         'compression_types': set(),
-        'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0})
+        'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
+        'compression_warnings': []  # Collect warnings from this batch
     }
     
     for packet_data in packet_data_list:
@@ -873,11 +1027,65 @@ def _process_packet_batch(args):
             if prb_raw is not None and parse_iq_from_prb_raw_func:
                 samples, compression_type, num_samples, exponents_list = parse_iq_from_prb_raw_func(
                     prb_raw, compression_method, compression_width, max_rbs=current_max_rbs)
+                # Detect compression warnings after parsing
+                # Get raw bytes from prb_raw to pass to detection function
+                if samples and len(samples) > 0:
+                    try:
+                        # Reconstruct raw bytes from prb_raw for detection
+                        all_hex_data = []
+                        for prb_entry in prb_raw:
+                            if isinstance(prb_entry, list) and len(prb_entry) > 0:
+                                hex_str = prb_entry[0]
+                                if isinstance(hex_str, str):
+                                    hex_clean = hex_str.translate(str.maketrans('', '', ': '))
+                                    try:
+                                        hex_bytes = bytes.fromhex(hex_clean)
+                                        all_hex_data.append(hex_bytes)
+                                    except ValueError:
+                                        continue
+                        if all_hex_data:
+                            iq_data_bytes = b''.join(all_hex_data)
+                            detect_module = importlib.import_module('PCAP_Analyzer_WS')
+                            detect_func = getattr(detect_module, 'detect_wrong_compression_settings', None)
+                            if detect_func:
+                                is_wrong, confidence, warnings = detect_func(
+                                    iq_data_bytes, samples, compression_type,
+                                    configured_compression='uncompressed' if compression_method == 0 else 'bfp',
+                                    configured_bitwidth=compression_width
+                                )
+                                if is_wrong and warnings:
+                                    warning_key = (confidence, warnings[0] if warnings else '')
+                                    warning_entry = {'confidence': confidence, 'warnings': warnings, 'key': warning_key}
+                                    if not any(w.get('key') == warning_key for w in batch_results['compression_warnings']):
+                                        batch_results['compression_warnings'].append(warning_entry)
+                    except Exception as e:
+                        # Silently continue if detection fails
+                        pass
             elif oran_data is not None and parse_iq_samples_func:
                 iq_offset = 8
                 samples, compression_type, num_samples, exponents_list = parse_iq_samples_func(
                     oran_data, iq_offset, 0, 0,
                     force_bfp=force_bfp, bfp_exponent=bfp_exponent, max_rbs=current_max_rbs)
+                # Detect compression warnings after parsing
+                if samples and len(samples) > 0:
+                    try:
+                        iq_data_bytes = oran_data[iq_offset:] if len(oran_data) > iq_offset else b''
+                        detect_module = importlib.import_module('PCAP_Analyzer_WS')
+                        detect_func = getattr(detect_module, 'detect_wrong_compression_settings', None)
+                        if detect_func:
+                            is_wrong, confidence, warnings = detect_func(
+                                iq_data_bytes, samples, compression_type,
+                                configured_compression=FORCE_COMPRESSION_TYPE.lower(),
+                                configured_bitwidth=FORCE_BFP_BITWIDTH
+                            )
+                            if is_wrong and warnings:
+                                warning_key = (confidence, warnings[0] if warnings else '')
+                                warning_entry = {'confidence': confidence, 'warnings': warnings, 'key': warning_key}
+                                if not any(w.get('key') == warning_key for w in batch_results['compression_warnings']):
+                                    batch_results['compression_warnings'].append(warning_entry)
+                    except Exception as e:
+                        # Silently continue if detection fails
+                        pass
             else:
                 continue  # Skip if no data
             
@@ -980,6 +1188,10 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
     Returns:
         tuple: (iq_data, analysis_data, total_packets)
     """
+    # Clear compression warnings for this run
+    global _compression_warnings
+    _compression_warnings.clear()
+    
     # Normalize path to handle relative paths correctly
     pcap_file = os.path.normpath(os.path.abspath(pcap_file))
     print(f"Reading {pcap_file} with pyshark...")
@@ -1163,7 +1375,9 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
         'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(make_frame_slot_data))))),
         'compression_types': set(),
         'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
-        'max_num_prbc': 0
+        'max_num_prbc': 0,  # Maximum declared PRBs (from num_prbc field)
+        'max_rb_index_with_data': 0,  # Maximum RB index that actually has IQ data
+        'compression_warnings': []  # Store compression detection warnings
     }
     
     print("Processing packets...")
@@ -1501,6 +1715,12 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
         # Phase 3: Merge results from all batches
         print("Phase 3: Merging results...")
         for batch_idx, batch_result in batch_results_list:
+            # Merge compression warnings from batch results
+            if 'compression_warnings' in batch_result:
+                for warning in batch_result['compression_warnings']:
+                    if warning not in _compression_warnings:
+                        _compression_warnings.append(warning)
+            
             # Process each packet result from the batch
             for packet_result in batch_result.get('packet_results', []):
                 # Extract data from packet result
@@ -1620,6 +1840,9 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, star
                 if len(samples) > 0 and len(rbs_with_data) > 0:
                     for rb_index in rbs_with_data:
                         frame_slot_data['rbs_with_data'].add(rb_index)
+                        # Track maximum RB index with actual data
+                        if rb_index > analysis_data.get('max_rb_index_with_data', 0):
+                            analysis_data['max_rb_index_with_data'] = rb_index
         
         # Add timestamps from original batch entries
         for batch_idx, batch in enumerate(packet_batches):
@@ -1778,8 +2001,27 @@ def print_analysis_report(analysis_data, total_packets, start_symbol=None, end_s
     print()
     
     # Print detected maximum PRBs
-    if analysis_data.get('max_num_prbc', 0) > 0:
-        print(f"Detected maximum PRBs: {analysis_data['max_num_prbc']}\n")
+    max_declared_prbs = analysis_data.get('max_num_prbc', 0)
+    max_rb_index_with_data = analysis_data.get('max_rb_index_with_data', 0)
+    
+    if max_declared_prbs > 0:
+        if max_rb_index_with_data > 0 and max_rb_index_with_data + 1 < max_declared_prbs:
+            print(f"Detected maximum declared PRBs: {max_declared_prbs}")
+            print(f"  (Maximum RB index with actual IQ data: {max_rb_index_with_data}, {max_rb_index_with_data + 1} RBs with data)")
+        else:
+            print(f"Detected maximum PRBs: {max_declared_prbs}\n")
+    
+    # Print compression warnings if any were detected
+    if _compression_warnings:
+        print("=" * 80)
+        print("COMPRESSION SETTINGS WARNING")
+        print("=" * 80)
+        # Print the highest confidence warning (most reliable)
+        best_warning = max(_compression_warnings, key=lambda x: x['confidence'])
+        for warning in best_warning['warnings']:
+            print(warning)
+        print("=" * 80)
+        print()
 
 def save_separated_data(iq_data, output_base):
     """Save IQ data separated by eAxC ID and direction"""
@@ -2133,6 +2375,10 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
         start_symbol: Start overall symbol number for filtering (inclusive, across all slots)
         end_symbol: End overall symbol number for filtering (inclusive, across all slots)
     """
+    # Clear compression warnings for this run
+    global _compression_warnings
+    _compression_warnings.clear()
+    
     # Normalize path to handle relative paths correctly
     pcap_file = os.path.normpath(os.path.abspath(pcap_file))
     print(f"Analyzing {pcap_file} with pyshark...")
@@ -2345,7 +2591,8 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
         'frame_subframe_slot_symbol_eaxc_data': defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(make_frame_slot_data))))),
         'compression_types': set(),
         'max_iq_values': defaultdict(lambda: {'max_i': 0.0, 'max_q': 0.0, 'max_abs': 0.0}),
-        'max_num_prbc': 0  # Track maximum num_prbc seen across all packets
+        'max_num_prbc': 0,  # Track maximum num_prbc seen across all packets
+        'max_rb_index_with_data': 0  # Maximum RB index that actually has IQ data
     }
     
     for packet in cap:
@@ -2563,6 +2810,9 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
                     for rb_idx in np.where(has_nonzero_per_rb)[0]:
                         actual_rb_index = start_prbc + rb_idx
                         frame_slot_data['rbs_with_data'].add(actual_rb_index)
+                        # Track maximum RB index with actual data
+                        if actual_rb_index > analysis_data.get('max_rb_index_with_data', 0):
+                            analysis_data['max_rb_index_with_data'] = actual_rb_index
             
         except Exception as e:
             continue
@@ -2714,8 +2964,27 @@ def analyze_pcap(pcap_file, force_bfp=False, bfp_exponent=None, start_symbol=Non
     print()
     
     # Print detected maximum PRBs
-    if analysis_data.get('max_num_prbc', 0) > 0:
-        print(f"Detected maximum PRBs: {analysis_data['max_num_prbc']}\n")
+    max_declared_prbs = analysis_data.get('max_num_prbc', 0)
+    max_rb_index_with_data = analysis_data.get('max_rb_index_with_data', 0)
+    
+    if max_declared_prbs > 0:
+        if max_rb_index_with_data > 0 and max_rb_index_with_data + 1 < max_declared_prbs:
+            print(f"Detected maximum declared PRBs: {max_declared_prbs}")
+            print(f"  (Maximum RB index with actual IQ data: {max_rb_index_with_data}, {max_rb_index_with_data + 1} RBs with data)")
+        else:
+            print(f"Detected maximum PRBs: {max_declared_prbs}\n")
+    
+    # Print compression warnings if any were detected
+    if _compression_warnings:
+        print("=" * 80)
+        print("COMPRESSION SETTINGS WARNING")
+        print("=" * 80)
+        # Print the highest confidence warning (most reliable)
+        best_warning = max(_compression_warnings, key=lambda x: x['confidence'])
+        for warning in best_warning['warnings']:
+            print(warning)
+        print("=" * 80)
+        print()
     
     # Create resource allocation plot (reuse function from original)
     if analysis_data['packet_count'] > 0:
@@ -3028,6 +3297,7 @@ if __name__ == "__main__":
     
     if len(iq_data) == 0:
         print("No IQ data found!")
+        print("Check Compression Settings!")
         sys.exit(1)
     
     # Print analysis report (uses data collected during extraction)
