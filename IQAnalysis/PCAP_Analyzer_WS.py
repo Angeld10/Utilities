@@ -2309,9 +2309,9 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     
     if show_plot:
         print("Displaying magnitude comparison plot...")
-        plt.show()
-    
-    plt.close()
+        # Don't call plt.show() here to allow multiple plots
+    else:
+        plt.close()
     
     # Create Constellation comparison plot - plot all samples
     ul_const_title = f'Uplink Constellation ({len(ul_samples):,} samples)'
@@ -2363,9 +2363,9 @@ def plot_comparison(iq_data, output_file, max_samples=10000, start_symbol=None, 
     
     if show_plot:
         print("Displaying constellation comparison plot...")
-        plt.show()
-    
-    plt.close()
+        # Don't call plt.show() here to allow multiple plots
+    else:
+        plt.close()
 
 def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, end_symbol=None, plots_dir=None, show_plot=False):
     """Create individual plots for each eAxC ID"""
@@ -2429,9 +2429,9 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
             
             if show_plot:
                 print(f"Displaying magnitude plot for eAxC {eaxc_id} {direction}...")
-                plt.show()
-            
-            plt.close()
+                # Don't call plt.show() here to allow multiple plots
+            else:
+                plt.close()
             
             # Create Constellation plot - plot unique samples without density coloring
             const_title = f'{title} - Constellation\n{sample_info}'
@@ -2466,9 +2466,9 @@ def plot_all_eaxc(iq_data, output_base, max_samples=10000, start_symbol=None, en
             
             if show_plot:
                 print(f"Displaying constellation plot for eAxC {eaxc_id} {direction}...")
-                plt.show()
-            
-            plt.close()
+                # Don't call plt.show() here to allow multiple plots
+            else:
+                plt.close()
     
     print()
 
@@ -3334,9 +3334,37 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False):
         
         if show_plot:
             print(f"Displaying resource allocation plot for eAxC {eaxc_id}...")
-            plt.show()
-        
-        plt.close()
+            # Don't call plt.show() here to allow multiple plots
+            
+            if mplcursors:
+                try:
+                    cursor = mplcursors.cursor(im, hover=True)
+                    @cursor.connect("add")
+                    def on_add(sel):
+                        x, y = sel.target
+                        col_idx = int(x + 0.5)
+                        row_idx = int(y + 0.5)
+                        
+                        # Ensure indices are within bounds
+                        if 0 <= col_idx < len(unique_combinations) and 0 <= row_idx < max_rbs:
+                            combo = unique_combinations[col_idx]
+                            if len(combo) == 4:
+                                f, sf, sl, sym = combo
+                                timing_str = f"Frame: {f}\nSubframe: {sf}\nSlot: {sl}\nSymbol: {sym}"
+                            else:
+                                f, sl, sym = combo
+                                timing_str = f"Frame: {f}\nSlot: {sl}\nSymbol: {sym}"
+                            
+                            val = grid[row_idx, col_idx]
+                            status = "Allocated" if val > 0 else "Empty"
+                            
+                            sel.annotation.set_text(f"{timing_str}\nRB Index: {row_idx}\nStatus: {status}")
+                        else:
+                            sel.annotation.set_text(f"X: {col_idx}\nY: {row_idx}")
+                except Exception as e:
+                    print(f"Warning: Could not enable interactive cursor for allocation plot: {e}")
+        else:
+            plt.close()
     
     print()  # Add blank line after all plots
 
@@ -3497,6 +3525,12 @@ if __name__ == "__main__":
                   show_plot=args.show_plots)
     
     print("Done!")
+    
+    # Show all plots at once if interactive mode is enabled
+    if args.show_plots:
+        import matplotlib.pyplot as plt
+        print("Displaying all plots...")
+        plt.show()
     
     # Calculate and print execution time
     end_time = time.time()
