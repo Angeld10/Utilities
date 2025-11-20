@@ -3222,7 +3222,7 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False, start_sy
     max_rbs_limit = analysis_data.get('max_num_prbc', 106) if analysis_data.get('max_num_prbc', 0) > 0 else 106
     
     # Get base name and directory for output files
-    # Create Plots directory in the workspace root (IQAnalysis folder)
+    # Create Plots directory in the workspace root (PCAP_Analysis folder)
     workspace_root = os.path.dirname(os.path.abspath(__file__)) if os.path.dirname(os.path.abspath(__file__)) else '.'
     plots_dir = os.path.join(workspace_root, 'Plots')
     os.makedirs(plots_dir, exist_ok=True)

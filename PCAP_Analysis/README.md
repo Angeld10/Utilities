@@ -6,7 +6,7 @@ Python tool for extracting and analyzing IQ samples from 5G NR Fronthaul PCAP fi
 
 - Extract IQ samples from ORAN Fronthaul PCAP captures
 - Separate data by eAxC ID and direction (UL/DL)
-- Support for BFP compression and uncompressed formats
+- Support for BFP compression and uncompressed formats (STATIC COMPRESSION ONLY)
 - Generate resource allocation plots
 - Export to NumPy format with metadata
 - Interactive GUI and command-line interface
