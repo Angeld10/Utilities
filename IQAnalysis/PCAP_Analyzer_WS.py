@@ -3623,15 +3623,6 @@ if __name__ == "__main__":
         force_bfp_setting = args.bfp
         bfp_bitwidth_setting = args.bitwidth if args.bitwidth is not None else FORCE_BFP_BITWIDTH
     
-    # Debug output
-    print(f"DEBUG: args.bfp = {args.bfp}")
-    print(f"DEBUG: args.bitwidth = {args.bitwidth}")
-    print(f"DEBUG: FORCE_COMPRESSION_TYPE = {FORCE_COMPRESSION_TYPE}")
-    print(f"DEBUG: FORCE_BFP_BITWIDTH = {FORCE_BFP_BITWIDTH}")
-    print(f"DEBUG: Using force_bfp_setting = {force_bfp_setting}")
-    print(f"DEBUG: Using bfp_bitwidth_setting = {bfp_bitwidth_setting}")
-    print()
-    
     # Extract IQ samples with metadata (also collects analysis data in a single pass)
     use_parallel = not args.no_parallel  # Default to parallel, disable if --no-parallel is set
     iq_data, analysis_data, total_packets = extract_iq_with_metadata(

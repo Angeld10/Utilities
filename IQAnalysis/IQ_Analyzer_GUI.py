@@ -260,9 +260,6 @@ class MainWindow(QMainWindow):
         self.btn_run.setEnabled(False)
         self.btn_run.setText("Running...")
         
-        # Debug: Print command to console
-        print(f"Executing command: {' '.join(cmd)}")
-        
         # Start worker
         self.worker = Worker(cmd)
         self.worker.output_received.connect(self.handle_output)
