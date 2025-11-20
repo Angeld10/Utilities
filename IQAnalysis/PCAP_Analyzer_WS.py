@@ -2233,8 +2233,8 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
     """Get a boolean mask for samples in the given symbol range (inclusive)
     
     Args:
-        start_symbol: Absolute overall symbol number (start)
-        end_symbol: Absolute overall symbol number (end)
+        start_symbol: Relative symbol number (start) - relative to first symbol in capture
+        end_symbol: Relative symbol number (end) - relative to first symbol in capture
     
     Returns:
         numpy array: Boolean mask where True indicates sample is in symbol range
@@ -2256,43 +2256,11 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
         mask[:] = True
         return mask
     
-    # Find first_overall_symbol from metadata to convert absolute symbols to relative
-    first_overall_symbol = None
-    for m in metadata:
-        if 'overall_symbol' in m:
-            if first_overall_symbol is None or m['overall_symbol'] < first_overall_symbol:
-                first_overall_symbol = m['overall_symbol']
-    
-    # If we couldn't find first_overall_symbol, try to calculate it
-    if first_overall_symbol is None:
-        for m in metadata:
-            if all(k in m for k in ['frame_id', 'subframe_id', 'slot_id', 'start_symbol_id']):
-                SYMBOLS_PER_SLOT = 14
-                SUBFRAMES_PER_FRAME = 10
-                SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
-                overall_sym = (m['frame_id'] * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
-                             (m['subframe_id'] * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
-                             (m['slot_id'] * SYMBOLS_PER_SLOT) + \
-                             m['start_symbol_id']
-                if first_overall_symbol is None or overall_sym < first_overall_symbol:
-                    first_overall_symbol = overall_sym
-    
-    # If still no first_overall_symbol, return all True (can't filter)
-    if first_overall_symbol is None:
-        mask[:] = True
-        return mask
-    
-    # Convert absolute symbols to relative
-    # start_symbol and end_symbol are absolute, relative_symbol in metadata is relative to first_overall_symbol
-    if start_symbol is not None:
-        start_symbol_relative = start_symbol - first_overall_symbol
-    else:
-        start_symbol_relative = 0
-    
-    if end_symbol is not None:
-        end_symbol_relative = end_symbol - first_overall_symbol
-    else:
-        end_symbol_relative = float('inf')
+    # Use input symbols directly as relative symbols
+    if start_symbol is None:
+        start_symbol = 0
+    if end_symbol is None:
+        end_symbol = float('inf')
     
     # Build mask by checking each packet's relative overall symbol
     current_sample_index = 0
@@ -2308,7 +2276,7 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
         num_samples = m['num_samples']
         
         # Check if this relative symbol is in our range
-        if start_symbol_relative <= relative_symbol <= end_symbol_relative:
+        if start_symbol <= relative_symbol <= end_symbol:
             mask[current_sample_index:current_sample_index + num_samples] = True
         
         current_sample_index += num_samples
@@ -3563,9 +3531,9 @@ if __name__ == "__main__":
     parser.add_argument('--samples', type=int, default=0, metavar='N',
                        help='Number of samples to plot (default: 0, use 0 to plot all samples)')
     parser.add_argument('--start-symbol', type=int, metavar='N',
-                       help='Start overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
+                       help='Start relative symbol number (0 = first symbol in capture)')
     parser.add_argument('--end-symbol', type=int, metavar='N',
-                       help='End overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
+                       help='End relative symbol number (relative to first symbol in capture)')
     parser.add_argument('--bfp', action='store_true',
                        help='Force BFP decompression')
     parser.add_argument('--bfp-exponent', type=int, metavar='N',
