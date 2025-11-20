@@ -1962,7 +1962,8 @@ def print_analysis_report(analysis_data, total_packets, start_symbol=None, end_s
             max_iq = analysis_data['max_iq_values'][eaxc_id]['max_abs']
             max_iq_str = f"{max_iq:.2f}" if max_iq > 0 else "N/A"
             dbfs = calculate_dbfs(max_iq)
-            dbfs_str = f"{dbfs:.2f} dBFS" if dbfs is not None else "N/A"
+            # Negate dBFS for backoff display: positive = backoff, negative = boost
+            dbfs_str = f"{-dbfs:.2f} dBFS" if dbfs is not None else "N/A"
             for direction in ['UL', 'DL']:
                 stats = analysis_data['eaxc_stats'][eaxc_id][direction]
                 # When filtering, use stats only from filtered packets
@@ -3726,6 +3727,29 @@ if __name__ == "__main__":
                   show_plot=args.show_plots)
     
     print("Done!")
+    
+    # Check for low IQ backoff and print warning
+    low_backoff_eaxcs = []
+    if analysis_data and 'max_iq_values' in analysis_data and analysis_data['max_iq_values']:
+        for eaxc_id in analysis_data['max_iq_values']:
+            max_iq = analysis_data['max_iq_values'][eaxc_id]['max_abs']
+            dbfs = calculate_dbfs(max_iq)
+            if dbfs is not None:
+                backoff = -dbfs  # Negate to get backoff (positive = backoff)
+                if backoff < 3.0:
+                    low_backoff_eaxcs.append((eaxc_id, backoff))
+    
+    if low_backoff_eaxcs:
+        print()
+        print("=" * 80)
+        print("WARNING: LOW IQ BACKOFF DETECTED")
+        print("=" * 80)
+        for eaxc_id, backoff in low_backoff_eaxcs:
+            print(f"  eAxC {eaxc_id}: IQ Backoff is {backoff:.2f} dBFS (less than 3 dBFS)")
+        print()
+        print("  WARNING: IQ Backoff is less than 3 dBFS. This might cause saturation,")
+        print("           impacting BLER (Block Error Rate).")
+        print("=" * 80)
     
     # Calculate and print execution time
     end_time = time.time()

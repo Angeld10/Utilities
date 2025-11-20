@@ -21,6 +21,8 @@ pip install -r requirements.txt
 
 Requirements: `pyshark`, `numpy`, `matplotlib`, `mplcursors`, `PyQt6`
 
+Wireshark needs to be installed (Tested with 4.6.0)
+
 ## Usage
 
 ### GUI Application (Recommended)
