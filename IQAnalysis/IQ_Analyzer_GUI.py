@@ -99,10 +99,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # 1. Drop Zone
+        # 1. Drop Zone with Browse Button
+        drop_browse_layout = QHBoxLayout()
+        
         self.drop_area = DropArea()
         self.drop_area.file_dropped.connect(self.on_file_dropped)
-        main_layout.addWidget(self.drop_area)
+        drop_browse_layout.addWidget(self.drop_area, stretch=3)
+        
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
+        self.btn_browse.clicked.connect(self.browse_file)
+        drop_browse_layout.addWidget(self.btn_browse, stretch=1)
+        
+        main_layout.addLayout(drop_browse_layout)
 
         # 2. Configuration Controls
         config_group = QFrame()
@@ -175,6 +184,11 @@ class MainWindow(QMainWindow):
         self.txt_report.setFont(QFont("Courier New", 9))
         self.tabs.addTab(self.txt_report, "Report")
         
+        self.txt_metadata = QTextEdit()
+        self.txt_metadata.setReadOnly(True)
+        self.txt_metadata.setFont(QFont("Courier New", 9))
+        self.tabs.addTab(self.txt_metadata, "Metadata")
+        
         main_layout.addWidget(self.tabs)
 
     def on_file_dropped(self, file_path):
@@ -191,6 +205,18 @@ class MainWindow(QMainWindow):
             }
         """)
         self.btn_run.setEnabled(True)
+    
+    def browse_file(self):
+        from PyQt6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select PCAP File",
+            "",
+            "PCAP Files (*.pcap *.pcapng);;All Files (*.*)"
+        )
+        if file_path:
+            self.on_file_dropped(file_path)
+
 
     def run_analysis(self):
         if not self.selected_file:
@@ -199,6 +225,7 @@ class MainWindow(QMainWindow):
         # Clear previous output
         self.txt_console.clear()
         self.txt_report.clear()
+        self.txt_metadata.clear()
         self.current_output_section = "Console"
         self.tabs.setCurrentIndex(0)
 
@@ -258,10 +285,47 @@ class MainWindow(QMainWindow):
                 self.txt_report.moveCursor(self.txt_report.textCursor().MoveOperation.End)
             self.current_output_section = "Console"  # Switch back to console only
             return  # Don't process further
+        elif "iq_separated_eAxC" in clean_line and "_metadata.json" in clean_line:
+            # Metadata file has been saved, load it and stats files now
+            self.load_metadata_and_stats()
             
         if self.current_output_section in ["Stats", "Metadata"]:
             self.txt_report.insertPlainText(line)
             self.txt_report.moveCursor(self.txt_report.textCursor().MoveOperation.End)
+
+    def load_metadata_and_stats(self):
+        """Load metadata.json and stats.txt files and populate tabs"""
+        import json
+        import glob
+        
+        # Find metadata.json file (iq_separated_eAxC*_metadata.json)
+        metadata_files = glob.glob("iq_separated_eAxC*_metadata.json")
+        if metadata_files:
+            try:
+                with open(metadata_files[0], 'r') as f:
+                    metadata = json.load(f)
+                    # Pretty print JSON with indentation
+                    formatted_json = json.dumps(metadata, indent=2)
+                    self.txt_metadata.setPlainText(formatted_json)
+            except Exception as e:
+                self.txt_metadata.setPlainText(f"Error loading metadata: {e}")
+        
+        # Find stats.txt file (iq_separated_eAxC*_DL_stats.txt or *_UL_stats.txt)
+        stats_files = glob.glob("iq_separated_eAxC*_stats.txt")
+        if stats_files:
+            try:
+                stats_content = ""
+                for stats_file in stats_files:
+                    with open(stats_file, 'r') as f:
+                        stats_content += f"\n{'='*80}\n"
+                        stats_content += f"FILE: {os.path.basename(stats_file)}\n"
+                        stats_content += f"{'='*80}\n"
+                        stats_content += f.read()
+                        stats_content += "\n"
+                # Append to report tab
+                self.txt_report.append(stats_content)
+            except Exception as e:
+                self.txt_report.append(f"\nError loading stats: {e}")
 
     def analysis_finished(self):
         self.btn_run.setEnabled(True)
