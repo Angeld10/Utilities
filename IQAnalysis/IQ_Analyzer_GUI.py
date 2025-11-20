@@ -232,11 +232,14 @@ class MainWindow(QMainWindow):
         # Construct command
         cmd = [sys.executable, 'PCAP_Analyzer_WS.py', self.selected_file]
         
-        # Compression settings
+        # Compression settings - always pass explicitly so globals aren't used
         if self.combo_compression.currentText() == "BFP":
-            cmd.append('--force-bfp')
-            cmd.extend(['--bfp-bitwidth', str(self.spin_bitwidth.value())])
-
+            cmd.append('--bfp')
+            cmd.extend(['--bitwidth', str(self.spin_bitwidth.value())])
+        else:
+            # Explicitly pass uncompressed settings
+            cmd.extend(['--bitwidth', '16'])  # 16-bit uncompressed
+        
         
         if self.check_interactive.isChecked():
             cmd.append('--show-plots')
@@ -256,6 +259,9 @@ class MainWindow(QMainWindow):
         # Disable run button
         self.btn_run.setEnabled(False)
         self.btn_run.setText("Running...")
+        
+        # Debug: Print command to console
+        print(f"Executing command: {' '.join(cmd)}")
         
         # Start worker
         self.worker = Worker(cmd)

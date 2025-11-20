@@ -27,10 +27,11 @@ except ImportError:
 
 # Import helper functions from the original script
 
-FORCE_COMPRESSION_TYPE = 'BFP'  # 'BFP' or 'uncompressed'
-FORCE_BFP_BITWIDTH = 9                  # 8-14 for BFP compression
-NUMEROLOGY = 1                            # 0 (15 kHz SCS) or 1 (30 kHz SCS)
-ENDIAN = 'big'                        # 'little' or 'big' endian for byte order
+# Global configuration - these are defaults that can be overridden by command-line arguments
+FORCE_COMPRESSION_TYPE = 'uncompressed'  # 'BFP' or 'uncompressed' - default compression type
+FORCE_BFP_BITWIDTH = 16          # 8-14 for BFP compression - default bitwidth
+NUMEROLOGY = 1                  # 0 (15 kHz SCS) or 1 (30 kHz SCS)
+ENDIAN = 'big'                  # 'little' or 'big' endian for byte order
 
 #Debug loop count
 debug_count = 0
@@ -1021,8 +1022,15 @@ def _process_packet_batch(args):
             current_max_rbs = packet_data.get('max_rbs', 106)
             
             # Get compression method and width
-            compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
-            compression_width = fields.get('compression_width', FORCE_BFP_BITWIDTH)
+            # If force_bfp is explicitly set (not None), override what Wireshark detected
+            if force_bfp is not None:
+                # User explicitly specified compression settings - use them
+                compression_method = 1 if force_bfp else 0  # 1 = BFP, 0 = uncompressed
+                compression_width = FORCE_BFP_BITWIDTH
+            else:
+                # No explicit setting - use what Wireshark detected from packet header
+                compression_method = fields.get('compression_method', 1 if FORCE_COMPRESSION_TYPE.upper() == 'BFP' else 0)
+                compression_width = fields.get('compression_width', FORCE_BFP_BITWIDTH)
             
             # Parse IQ samples
             samples = []
@@ -1184,7 +1192,7 @@ def _process_packet_batch(args):
     
     return batch_results
 
-def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, bfp_bitwidth=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False, use_parallel=True):
+def extract_iq_with_metadata(pcap_file, force_bfp=None, bfp_exponent=None, bfp_bitwidth=None, start_symbol=None, end_symbol=None, restrict_to_first_combo=False, use_parallel=True):
     """Extract IQ samples with direction and eAxC ID information using pyshark.
     Also collects analysis statistics for reporting.
     
@@ -1242,8 +1250,14 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, bfp_
         # Set compression method preference for ORAN FH CUS
         # Use string values as specified in TShark preferences (case-insensitive)
         # Valid values: "COMP_NONE", "COMP_BLOCK_FP", "No Compression", "Block Floating Point Compression", etc.
-        # Use arguments if provided, otherwise fall back to globals
-        use_bfp = force_bfp if force_bfp else (FORCE_COMPRESSION_TYPE.upper() == 'BFP')
+        # force_bfp can be: None (use global), True (force BFP), or False (force uncompressed)
+        if force_bfp is None:
+            # Not explicitly set - use global
+            use_bfp = (FORCE_COMPRESSION_TYPE.upper() == 'BFP')
+        else:
+            # Explicitly set by caller
+            use_bfp = force_bfp
+        
         bitwidth = bfp_bitwidth if bfp_bitwidth is not None else FORCE_BFP_BITWIDTH
         
         if use_bfp:
@@ -1262,7 +1276,7 @@ def extract_iq_with_metadata(pcap_file, force_bfp=False, bfp_exponent=None, bfp_
             'oran_fh_cus.oran.iq_bitwidth_down': iq_bitwidth,
         }
         
-        print(f"\nSetting ORAN FH CUS protocol preferences (based on FORCE_COMPRESSION_TYPE='{FORCE_COMPRESSION_TYPE}'):")
+        print(f"\nSetting ORAN FH CUS protocol preferences (force_bfp={force_bfp}, use_bfp={use_bfp}, bitwidth={bitwidth}):")
         print("-" * 60)
         for pref_name, pref_value in override_prefs.items():
             if "ud_comp" in pref_name:
@@ -2217,6 +2231,10 @@ def calculate_samples_for_symbols(iq_data, eaxc_id, direction, num_symbols):
 def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, end_symbol=None):
     """Get a boolean mask for samples in the given symbol range (inclusive)
     
+    Args:
+        start_symbol: Absolute overall symbol number (start)
+        end_symbol: Absolute overall symbol number (end)
+    
     Returns:
         numpy array: Boolean mask where True indicates sample is in symbol range
     """
@@ -2237,11 +2255,43 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
         mask[:] = True
         return mask
     
-    # Set defaults
-    if start_symbol is None:
-        start_symbol = 0
-    if end_symbol is None:
-        end_symbol = 63  # Maximum symbol ID in 5G NR
+    # Find first_overall_symbol from metadata to convert absolute symbols to relative
+    first_overall_symbol = None
+    for m in metadata:
+        if 'overall_symbol' in m:
+            if first_overall_symbol is None or m['overall_symbol'] < first_overall_symbol:
+                first_overall_symbol = m['overall_symbol']
+    
+    # If we couldn't find first_overall_symbol, try to calculate it
+    if first_overall_symbol is None:
+        for m in metadata:
+            if all(k in m for k in ['frame_id', 'subframe_id', 'slot_id', 'start_symbol_id']):
+                SYMBOLS_PER_SLOT = 14
+                SUBFRAMES_PER_FRAME = 10
+                SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
+                overall_sym = (m['frame_id'] * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                             (m['subframe_id'] * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                             (m['slot_id'] * SYMBOLS_PER_SLOT) + \
+                             m['start_symbol_id']
+                if first_overall_symbol is None or overall_sym < first_overall_symbol:
+                    first_overall_symbol = overall_sym
+    
+    # If still no first_overall_symbol, return all True (can't filter)
+    if first_overall_symbol is None:
+        mask[:] = True
+        return mask
+    
+    # Convert absolute symbols to relative
+    # start_symbol and end_symbol are absolute, relative_symbol in metadata is relative to first_overall_symbol
+    if start_symbol is not None:
+        start_symbol_relative = start_symbol - first_overall_symbol
+    else:
+        start_symbol_relative = 0
+    
+    if end_symbol is not None:
+        end_symbol_relative = end_symbol - first_overall_symbol
+    else:
+        end_symbol_relative = float('inf')
     
     # Build mask by checking each packet's relative overall symbol
     current_sample_index = 0
@@ -2249,20 +2299,7 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
     for m in metadata:
         relative_symbol = m.get('relative_symbol')
         if relative_symbol is None:
-            # Fallback: calculate relative symbol from metadata fields if not stored
-            frame_id = m.get('frame_id', 0)
-            subframe_id = m.get('subframe_id', 0)
-            slot_id = m.get('slot_id', 0)
-            start_symbol_id = m.get('start_symbol_id', 0)
-            SYMBOLS_PER_SLOT = 14
-            SUBFRAMES_PER_FRAME = 10
-            SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
-            overall_symbol = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
-                            (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
-                            (slot_id * SYMBOLS_PER_SLOT) + \
-                            start_symbol_id
-            # We don't have first_overall_symbol here, so skip filtering (return all True)
-            # This shouldn't happen if metadata is created correctly
+            # Skip if we can't determine relative symbol
             mask[current_sample_index:current_sample_index + m['num_samples']] = True
             current_sample_index += m['num_samples']
             continue
@@ -2270,7 +2307,7 @@ def get_sample_mask_for_symbols(iq_data, eaxc_id, direction, start_symbol=None, 
         num_samples = m['num_samples']
         
         # Check if this relative symbol is in our range
-        if start_symbol <= relative_symbol <= end_symbol:
+        if start_symbol_relative <= relative_symbol <= end_symbol_relative:
             mask[current_sample_index:current_sample_index + num_samples] = True
         
         current_sample_index += num_samples
@@ -3277,43 +3314,42 @@ def plot_resource_allocation(analysis_data, pcap_file, show_plot=False, start_sy
                     if has_data_for_slot:
                         slots_with_data.add(slot_key)
         
-        # Now create unique_combinations that includes ALL 14 symbols (0-13) for each slot that has data
-        # Missing symbols will show as unallocated (gray) in the plot
+        # Now create unique_combinations that includes ONLY symbols that have data
+        # This avoids showing empty symbols (e.g., symbols 6-13 when capture ends at symbol 5)
         unique_combinations = []
-        SYMBOLS_PER_SLOT_PLOT = 14  # 5G NR has 14 symbols per slot (normal cyclic prefix)
         
         for slot_key in sorted(slots_with_data):
             frame_id, subframe_id, slot_id = slot_key
-            # Include all 14 symbols (0-13) for this slot, even if they don't have data
-            for symbol_id in range(SYMBOLS_PER_SLOT_PLOT):
-                # Check if this symbol is within the requested range
-                # Calculate overall symbol number
-                SUBFRAMES_PER_FRAME = 10
-                SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
-                SYMBOLS_PER_SLOT = 14
-                
-                overall_sym = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
-                              (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
-                              (slot_id * SYMBOLS_PER_SLOT) + \
-                              symbol_id
-                
-                first_overall_symbol = analysis_data.get('first_overall_symbol')
-                if first_overall_symbol is not None:
-                    relative_sym = overall_sym - first_overall_symbol
-                else:
-                    relative_sym = 0 # Should not happen if data exists
-                
-                # Filter based on start_symbol and end_symbol (relative)
-                if start_symbol is not None and relative_sym < start_symbol:
-                    continue
-                if end_symbol is not None and relative_sym > end_symbol:
-                    continue
-                
+            # Only include symbols that actually have data for this slot
+            for symbol_id in range(14):  # Check all possible symbols (0-13)
                 combo = (frame_id, subframe_id, slot_id, symbol_id)
-                unique_combinations.append(combo)
-                # If this combo doesn't have data, create an empty entry (will show as unallocated)
-                if combo not in combination_data:
-                    combination_data[combo] = {'samples': 0, 'rbs': 0, 'packets': 0, 'start_prbc': 0, 'rbs_with_data': set()}
+                # Only add this combination if it has data
+                if combo in combination_data:
+                    # Check if this symbol is within the requested range
+                    # Calculate overall symbol number
+                    SUBFRAMES_PER_FRAME = 10
+                    SLOTS_PER_SUBFRAME = 2 if NUMEROLOGY == 1 else 1
+                    SYMBOLS_PER_SLOT = 14
+                    
+                    overall_sym = (frame_id * SUBFRAMES_PER_FRAME * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                                  (subframe_id * SLOTS_PER_SUBFRAME * SYMBOLS_PER_SLOT) + \
+                                  (slot_id * SYMBOLS_PER_SLOT) + \
+                                  symbol_id
+                    
+                    first_overall_symbol = analysis_data.get('first_overall_symbol')
+                    if first_overall_symbol is not None:
+                        relative_sym = overall_sym - first_overall_symbol
+                    else:
+                        relative_sym = 0 # Should not happen if data exists
+                    
+                    # Filter based on start_symbol and end_symbol (relative)
+                    if start_symbol is not None and relative_sym < start_symbol:
+                        continue
+                    if end_symbol is not None and relative_sym > end_symbol:
+                        continue
+                    
+                    # This symbol has data and is in range, add it
+                    unique_combinations.append(combo)
         
         if len(unique_combinations) == 0:
             continue  # Skip this eAxC ID if no data
@@ -3529,12 +3565,12 @@ if __name__ == "__main__":
                        help='Start overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
     parser.add_argument('--end-symbol', type=int, metavar='N',
                        help='End overall symbol number (across all slots, calculated as slot_id * 14 + symbol_id)')
-    parser.add_argument('--force-bfp', action='store_true',
+    parser.add_argument('--bfp', action='store_true',
                        help='Force BFP decompression')
     parser.add_argument('--bfp-exponent', type=int, metavar='N',
                        help='BFP exponent value (0-15)')
-    parser.add_argument('--bfp-bitwidth', type=int, default=9, metavar='N',
-                       help='BFP bitwidth (8-14) for forced decompression (default: 9)')
+    parser.add_argument('--bitwidth', type=int, default=None, metavar='N',
+                       help=f'Bitwidth: 8-14 for BFP, 16 for uncompressed (default: {FORCE_BFP_BITWIDTH})')
     parser.add_argument('--no-parallel', action='store_true',
                        help='Disable parallel processing (process packets sequentially)')
     parser.add_argument('--show-plots', action='store_true',
@@ -3575,10 +3611,30 @@ if __name__ == "__main__":
     # Disable restriction to first combo to allow symbols to span across slots
     restrict_to_first = False
     
+    # Use global variables as defaults ONLY if no compression arguments provided at all
+    # If any compression argument is provided, use those explicitly
+    if not args.bfp and args.bitwidth is None:
+        # No compression arguments provided - use globals
+        force_bfp_setting = (FORCE_COMPRESSION_TYPE.upper() == 'BFP')
+        bfp_bitwidth_setting = FORCE_BFP_BITWIDTH
+    else:
+        # Compression arguments provided - use them explicitly
+        force_bfp_setting = args.bfp
+        bfp_bitwidth_setting = args.bitwidth if args.bitwidth is not None else FORCE_BFP_BITWIDTH
+    
+    # Debug output
+    print(f"DEBUG: args.bfp = {args.bfp}")
+    print(f"DEBUG: args.bitwidth = {args.bitwidth}")
+    print(f"DEBUG: FORCE_COMPRESSION_TYPE = {FORCE_COMPRESSION_TYPE}")
+    print(f"DEBUG: FORCE_BFP_BITWIDTH = {FORCE_BFP_BITWIDTH}")
+    print(f"DEBUG: Using force_bfp_setting = {force_bfp_setting}")
+    print(f"DEBUG: Using bfp_bitwidth_setting = {bfp_bitwidth_setting}")
+    print()
+    
     # Extract IQ samples with metadata (also collects analysis data in a single pass)
     use_parallel = not args.no_parallel  # Default to parallel, disable if --no-parallel is set
     iq_data, analysis_data, total_packets = extract_iq_with_metadata(
-        args.pcap_file, force_bfp=args.force_bfp, bfp_exponent=args.bfp_exponent, bfp_bitwidth=args.bfp_bitwidth,
+        args.pcap_file, force_bfp=force_bfp_setting, bfp_exponent=args.bfp_exponent, bfp_bitwidth=bfp_bitwidth_setting,
         start_symbol=start_symbol, end_symbol=end_symbol, restrict_to_first_combo=restrict_to_first,
         use_parallel=use_parallel)
     
