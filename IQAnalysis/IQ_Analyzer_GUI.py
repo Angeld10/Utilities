@@ -164,13 +164,23 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(config_group)
 
-        # 3. Run Button
+        # 3. Buttons
+        button_layout = QHBoxLayout()
+        
         self.btn_run = QPushButton("Run Analysis")
         self.btn_run.setHeight = 40
         self.btn_run.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
         self.btn_run.clicked.connect(self.run_analysis)
-        self.btn_run.setEnabled(False) # Disabled until file selected
-        main_layout.addWidget(self.btn_run)
+        self.btn_run.setEnabled(False)
+        button_layout.addWidget(self.btn_run)
+        
+        self.btn_close_plots = QPushButton("Close All Plots")
+        self.btn_close_plots.setHeight = 40
+        self.btn_close_plots.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 10px;")
+        self.btn_close_plots.clicked.connect(self.close_all_plots)
+        button_layout.addWidget(self.btn_close_plots)
+        
+        main_layout.addLayout(button_layout)
 
         # 4. Output Console (Tabs)
         self.tabs = QTabWidget()
@@ -334,6 +344,62 @@ class MainWindow(QMainWindow):
         self.btn_run.setEnabled(True)
         self.btn_run.setText("Run Analysis")
         QMessageBox.information(self, "Analysis Complete", "The analysis has finished.")
+    
+    def close_all_plots(self):
+        """Close all open matplotlib plot windows"""
+        try:
+            import subprocess
+            import platform
+            
+            if platform.system() == 'Windows':
+                # Use a Python script to enumerate and close matplotlib windows
+                # This is safer as it only closes windows created by matplotlib
+                close_script = '''
+import sys
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib
+    # Close all figures in the current matplotlib instance
+    plt.close("all")
+    # Force matplotlib to quit
+    if hasattr(matplotlib, "interactive") and matplotlib.interactive():
+        matplotlib.pyplot.ioff()
+except:
+    pass
+'''
+                # Run in a separate Python process to access matplotlib's state
+                subprocess.run([sys.executable, '-c', close_script], timeout=2)
+                
+                # Alternative: Use pywinauto or win32gui to close windows by class name
+                # But this requires additional dependencies, so we'll use a simpler approach
+                try:
+                    # Try to import win32gui if available (optional)
+                    import win32gui
+                    import win32con
+                    
+                    def close_matplotlib_windows(hwnd, _):
+                        # Get window class name
+                        class_name = win32gui.GetClassName(hwnd)
+                        # Matplotlib windows typically have class name starting with 'Qt' or 'Tk'
+                        # and title containing 'Figure'
+                        title = win32gui.GetWindowText(hwnd)
+                        if 'Figure' in title and ('Qt' in class_name or 'Tk' in class_name):
+                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                        return True
+                    
+                    win32gui.EnumWindows(close_matplotlib_windows, None)
+                except ImportError:
+                    # win32gui not available, that's okay
+                    pass
+            else:
+                # On Linux/Mac, close matplotlib figures
+                subprocess.run([sys.executable, '-c', 
+                               'import matplotlib.pyplot as plt; plt.close("all")'], timeout=2)
+            
+            QMessageBox.information(self, "Plots Closed", "Attempted to close all matplotlib plot windows.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error closing plots: {e}")
+
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
