@@ -148,19 +148,40 @@ class MainWindow(QMainWindow):
         self.spin_start_symbol.setValue(-1)
         self.spin_start_symbol.setSpecialValueText("None")
         
+        start_symbol_layout = QHBoxLayout()
+        start_symbol_layout.addWidget(self.spin_start_symbol)
+        btn_reset_start = QPushButton("Reset")
+        btn_reset_start.setMaximumWidth(60)
+        btn_reset_start.clicked.connect(lambda: self.spin_start_symbol.setValue(-1))
+        start_symbol_layout.addWidget(btn_reset_start)
+        
         self.spin_end_symbol = QSpinBox()
         self.spin_end_symbol.setRange(-1, 100000)
         self.spin_end_symbol.setValue(-1)
         self.spin_end_symbol.setSpecialValueText("None")
+        
+        end_symbol_layout = QHBoxLayout()
+        end_symbol_layout.addWidget(self.spin_end_symbol)
+        btn_reset_end = QPushButton("Reset")
+        btn_reset_end.setMaximumWidth(60)
+        btn_reset_end.clicked.connect(lambda: self.spin_end_symbol.setValue(-1))
+        end_symbol_layout.addWidget(btn_reset_end)
 
         self.spin_num_symbols = QSpinBox()
         self.spin_num_symbols.setRange(0, 100000)
         self.spin_num_symbols.setValue(0)
         self.spin_num_symbols.setSpecialValueText("None")
+        
+        num_symbols_layout = QHBoxLayout()
+        num_symbols_layout.addWidget(self.spin_num_symbols)
+        btn_reset_num = QPushButton("Reset")
+        btn_reset_num.setMaximumWidth(60)
+        btn_reset_num.clicked.connect(lambda: self.spin_num_symbols.setValue(0))
+        num_symbols_layout.addWidget(btn_reset_num)
 
-        config_layout.addRow("Start Symbol:", self.spin_start_symbol)
-        config_layout.addRow("End Symbol:", self.spin_end_symbol)
-        config_layout.addRow("Number of Symbols:", self.spin_num_symbols)
+        config_layout.addRow("Start Symbol:", start_symbol_layout)
+        config_layout.addRow("End Symbol:", end_symbol_layout)
+        config_layout.addRow("Number of Symbols:", num_symbols_layout)
 
         main_layout.addWidget(config_group)
 
